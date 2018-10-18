@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2008-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -165,10 +165,9 @@ int kgsl_memfree_find_entry(pid_t ptname, uint64_t *gpuaddr,
 	return 0;
 }
 
-static void kgsl_memfree_purge(struct kgsl_pagetable *pagetable,
-		uint64_t gpuaddr, uint64_t size)
+static void kgsl_memfree_purge(pid_t ptname, uint64_t gpuaddr,
+		uint64_t size)
 {
-	pid_t ptname = pagetable ? pagetable->name : 0;
 	int i;
 
 	if (memfree.list == NULL)
@@ -250,9 +249,6 @@ kgsl_mem_entry_create(void)
 	if (entry != NULL) {
 		kref_init(&entry->refcount);
 		INIT_WORK(&entry->work, _deferred_put);
-
-		/* put this ref in the caller functions after init */
-		kref_get(&entry->refcount);
 	}
 
 	return entry;
@@ -335,24 +331,60 @@ kgsl_mem_entry_destroy(struct kref *kref)
 }
 EXPORT_SYMBOL(kgsl_mem_entry_destroy);
 
-/* Allocate a IOVA for memory objects that don't use SVM */
-static int kgsl_mem_entry_track_gpuaddr(struct kgsl_device *device,
-		struct kgsl_process_private *process,
-		struct kgsl_mem_entry *entry)
+/**
+ * kgsl_mem_entry_track_gpuaddr - Insert a mem_entry in the address tree and
+ * assign it with a gpu address space before insertion
+ * @process: the process that owns the memory
+ * @entry: the memory entry
+ *
+ * @returns - 0 on succcess else error code
+ *
+ * Insert the kgsl_mem_entry in to the rb_tree for searching by GPU address.
+ * The assignment of gpu address and insertion into list needs to
+ * happen with the memory lock held to avoid race conditions between
+ * gpu address being selected and some other thread looking through the
+ * rb list in search of memory based on gpuaddr
+ * This function should be called with processes memory spinlock held
+ */
+static int
+kgsl_mem_entry_track_gpuaddr(struct kgsl_process_private *process,
+				struct kgsl_mem_entry *entry)
 {
-	struct kgsl_pagetable *pagetable;
+	struct kgsl_pagetable *pagetable = process->pagetable;
 
 	/*
-	 * If SVM is enabled for this object then the address needs to be
-	 * assigned elsewhere
+	 * If cpu=gpu map is used then caller needs to set the
+	 * gpu address
 	 */
-	if (kgsl_memdesc_use_cpu_map(&entry->memdesc))
-		return 0;
-
-	pagetable = kgsl_memdesc_is_secured(&entry->memdesc) ?
-		device->mmu.securepagetable : process->pagetable;
+	if (kgsl_memdesc_use_cpu_map(&entry->memdesc)) {
+		if (!entry->memdesc.gpuaddr)
+			return 0;
+	} else if (entry->memdesc.gpuaddr) {
+		WARN_ONCE(1, "gpuaddr assigned w/o holding memory lock\n");
+		return -EINVAL;
+	}
+	if (kgsl_memdesc_is_secured(&entry->memdesc))
+		pagetable = pagetable->mmu->securepagetable;
 
 	return kgsl_mmu_get_gpuaddr(pagetable, &entry->memdesc);
+}
+
+/**
+ * kgsl_mem_entry_untrack_gpuaddr() - Untrack memory that is previously tracked
+ * process - Pointer to process private to which memory belongs
+ * entry - Memory entry to untrack
+ *
+ * Function just does the opposite of kgsl_mem_entry_track_gpuaddr. Needs to be
+ * called with processes spin lock held
+ */
+static void
+kgsl_mem_entry_untrack_gpuaddr(struct kgsl_process_private *process,
+				struct kgsl_mem_entry *entry)
+{
+	struct kgsl_pagetable *pagetable = entry->memdesc.pagetable;
+
+	if (entry->memdesc.gpuaddr)
+		kgsl_mmu_put_gpuaddr(pagetable, &entry->memdesc);
 }
 
 /* Commit the entry to the process so it can be accessed by other operations */
@@ -366,26 +398,29 @@ static void kgsl_mem_entry_commit_process(struct kgsl_mem_entry *entry)
 	spin_unlock(&entry->priv->mem_lock);
 }
 
-/*
- * Attach the memory object to a process by (possibly) getting a GPU address and
- * (possibly) mapping it
+/**
+ * kgsl_mem_entry_attach_process - Attach a mem_entry to its owner process
+ * @entry: the memory entry
+ * @process: the owner process
+ *
+ * Attach a newly created mem_entry to its owner process so that
+ * it can be found later. The mem_entry will be added to mem_idr and have
+ * its 'id' field assigned.
+ *
+ * @returns - 0 on success or error code on failure.
  */
-static int kgsl_mem_entry_attach_process(struct kgsl_device *device,
-		struct kgsl_process_private *process,
-		struct kgsl_mem_entry *entry)
+int
+kgsl_mem_entry_attach_process(struct kgsl_mem_entry *entry,
+				   struct kgsl_device_private *dev_priv)
 {
-	int id, ret;
+	int id;
+	int ret;
+	struct kgsl_process_private *process = dev_priv->process_priv;
+	struct kgsl_pagetable *pagetable = NULL;
 
 	ret = kgsl_process_private_get(process);
 	if (!ret)
 		return -EBADF;
-
-	ret = kgsl_mem_entry_track_gpuaddr(device, process, entry);
-	if (ret) {
-		kgsl_process_private_put(process);
-		return ret;
-	}
-
 	idr_preload(GFP_KERNEL);
 	spin_lock(&process->mem_lock);
 	/* Allocate the ID but don't attach the pointer just yet */
@@ -394,41 +429,57 @@ static int kgsl_mem_entry_attach_process(struct kgsl_device *device,
 	idr_preload_end();
 
 	if (id < 0) {
-		if (!kgsl_memdesc_use_cpu_map(&entry->memdesc))
-			kgsl_mmu_put_gpuaddr(&entry->memdesc);
-		kgsl_process_private_put(process);
-		return id;
+		ret = id;
+		goto err_put_proc_priv;
 	}
 
 	entry->id = id;
 	entry->priv = process;
 
-	/*
-	 * Map the memory if a GPU address is already assigned, either through
-	 * kgsl_mem_entry_track_gpuaddr() or via some other SVM process
-	 */
-	if (entry->memdesc.gpuaddr) {
-		ret = kgsl_mmu_map(entry->memdesc.pagetable, &entry->memdesc);
+	ret = kgsl_mem_entry_track_gpuaddr(process, entry);
+	if (ret) {
+		spin_lock(&process->mem_lock);
+		idr_remove(&process->mem_idr, entry->id);
+		spin_unlock(&process->mem_lock);
+		goto err_put_proc_priv;
+	}
 
+	/* map the memory after unlocking if gpuaddr has been assigned */
+	if (entry->memdesc.gpuaddr) {
+		/* if a secured buffer map it to secure global pagetable */
+		if (kgsl_memdesc_is_secured(&entry->memdesc))
+			pagetable = process->pagetable->mmu->securepagetable;
+		else
+			pagetable = process->pagetable;
+
+		entry->memdesc.pagetable = pagetable;
+		ret = kgsl_mmu_map(pagetable, &entry->memdesc);
 		if (ret)
 			kgsl_mem_entry_detach_process(entry);
 	}
 
-	kgsl_memfree_purge(entry->memdesc.pagetable, entry->memdesc.gpuaddr,
-		entry->memdesc.size);
+	kgsl_memfree_purge(pagetable ? pagetable->name : 0,
+		entry->memdesc.gpuaddr, entry->memdesc.size);
 
+	return ret;
+
+err_put_proc_priv:
+	kgsl_process_private_put(process);
 	return ret;
 }
 
 /* Detach a memory entry from a process and unmap it from the MMU */
+
 static void kgsl_mem_entry_detach_process(struct kgsl_mem_entry *entry)
 {
 	unsigned int type;
-
 	if (entry == NULL)
 		return;
 
-	kgsl_mmu_put_gpuaddr(&entry->memdesc);
+	/* Unmap here so that below we can call kgsl_mmu_put_gpuaddr */
+	kgsl_mmu_unmap(entry->memdesc.pagetable, &entry->memdesc);
+
+	kgsl_mem_entry_untrack_gpuaddr(entry->priv, entry);
 
 	spin_lock(&entry->priv->mem_lock);
 	if (entry->id != 0)
@@ -1657,9 +1708,9 @@ long kgsl_ioctl_drawctxt_create(struct kgsl_device_private *dev_priv,
 	/* Commit the pointer to the context in context_idr */
 	write_lock(&device->context_lock);
 	idr_replace(&device->context_idr, context, context->id);
-	param->drawctxt_id = context->id;
 	write_unlock(&device->context_lock);
 
+	param->drawctxt_id = context->id;
 done:
 	return result;
 }
@@ -2022,20 +2073,9 @@ static int kgsl_setup_anon_useraddr(struct kgsl_pagetable *pagetable,
 	entry->memdesc.pagetable = pagetable;
 	entry->memdesc.size = (uint64_t) size;
 	entry->memdesc.useraddr = hostptr;
-	entry->memdesc.flags |= KGSL_MEMFLAGS_USERMEM_ADDR;
-
-	if (kgsl_memdesc_use_cpu_map(&entry->memdesc)) {
-		int ret;
-
-		/* Register the address in the database */
-		ret = kgsl_mmu_set_svm_region(pagetable,
-			(uint64_t) entry->memdesc.useraddr, (uint64_t) size);
-
-		if (ret)
-			return ret;
-
+	if (kgsl_memdesc_use_cpu_map(&entry->memdesc))
 		entry->memdesc.gpuaddr = (uint64_t)  entry->memdesc.useraddr;
-	}
+	entry->memdesc.flags |= KGSL_MEMFLAGS_USERMEM_ADDR;
 
 	return memdesc_sg_virt(&entry->memdesc, NULL);
 }
@@ -2109,23 +2149,21 @@ static int kgsl_setup_dmabuf_useraddr(struct kgsl_device *device,
 		if (fd != 0)
 			dmabuf = dma_buf_get(fd - 1);
 	}
+	up_read(&current->mm->mmap_sem);
 
-	if (IS_ERR_OR_NULL(dmabuf)) {
-		up_read(&current->mm->mmap_sem);
-		return dmabuf ? PTR_ERR(dmabuf) : -ENODEV;
-	}
+	if (dmabuf == NULL)
+		return -ENODEV;
 
 	ret = kgsl_setup_dma_buf(device, pagetable, entry, dmabuf);
 	if (ret) {
 		dma_buf_put(dmabuf);
-		up_read(&current->mm->mmap_sem);
 		return ret;
 	}
 
 	/* Setup the user addr/cache mode for cache operations */
 	entry->memdesc.useraddr = hostptr;
 	_setup_cache_mode(entry, vma);
-	up_read(&current->mm->mmap_sem);
+
 	return 0;
 }
 #else
@@ -2162,7 +2200,7 @@ static long _gpuobj_map_useraddr(struct kgsl_device *device,
 		struct kgsl_mem_entry *entry,
 		struct kgsl_gpuobj_import *param)
 {
-	struct kgsl_gpuobj_import_useraddr useraddr = {0};
+	struct kgsl_gpuobj_import_useraddr useraddr;
 	int ret;
 
 	param->flags &= KGSL_MEMFLAGS_GPUREADONLY
@@ -2288,7 +2326,7 @@ long kgsl_ioctl_gpuobj_import(struct kgsl_device_private *dev_priv,
 
 	param->flags = entry->memdesc.flags;
 
-	ret = kgsl_mem_entry_attach_process(dev_priv->device, private, entry);
+	ret = kgsl_mem_entry_attach_process(entry, dev_priv);
 	if (ret)
 		goto unmap;
 
@@ -2304,9 +2342,6 @@ long kgsl_ioctl_gpuobj_import(struct kgsl_device_private *dev_priv,
 	trace_kgsl_mem_map(entry, fd);
 
 	kgsl_mem_entry_commit_process(entry);
-
-	/* put the extra refcount for kgsl_mem_entry_create() */
-	kgsl_mem_entry_put(entry);
 	return 0;
 
 unmap:
@@ -2406,8 +2441,6 @@ static int kgsl_setup_dma_buf(struct kgsl_device *device,
 	meta->dmabuf = dmabuf;
 	meta->attach = attach;
 
-	attach->priv = entry;
-
 	entry->priv_data = meta;
 	entry->memdesc.pagetable = pagetable;
 	entry->memdesc.size = 0;
@@ -2455,45 +2488,6 @@ out:
 	}
 
 	return ret;
-}
-#endif
-
-#ifdef CONFIG_DMA_SHARED_BUFFER
-void kgsl_get_egl_counts(struct kgsl_mem_entry *entry,
-		int *egl_surface_count, int *egl_image_count)
-{
-	struct kgsl_dma_buf_meta *meta = entry->priv_data;
-	struct dma_buf *dmabuf = meta->dmabuf;
-	struct dma_buf_attachment *mem_entry_buf_attachment = meta->attach;
-	struct device *buf_attachment_dev = mem_entry_buf_attachment->dev;
-	struct dma_buf_attachment *attachment = NULL;
-
-	mutex_lock(&dmabuf->lock);
-	list_for_each_entry(attachment, &dmabuf->attachments, node) {
-		struct kgsl_mem_entry *scan_mem_entry = NULL;
-
-		if (attachment->dev != buf_attachment_dev)
-			continue;
-
-		scan_mem_entry = attachment->priv;
-		if (!scan_mem_entry)
-			continue;
-
-		switch (kgsl_memdesc_get_memtype(&scan_mem_entry->memdesc)) {
-		case KGSL_MEMTYPE_EGL_SURFACE:
-			(*egl_surface_count)++;
-			break;
-		case KGSL_MEMTYPE_EGL_IMAGE:
-			(*egl_image_count)++;
-			break;
-		}
-	}
-	mutex_unlock(&dmabuf->lock);
-}
-#else
-void kgsl_get_egl_counts(struct kgsl_mem_entry *entry,
-		int *egl_surface_count, int *egl_image_count)
-{
 }
 #endif
 
@@ -2600,8 +2594,7 @@ long kgsl_ioctl_map_user_mem(struct kgsl_device_private *dev_priv,
 	/* echo back flags */
 	param->flags = (unsigned int) entry->memdesc.flags;
 
-	result = kgsl_mem_entry_attach_process(dev_priv->device, private,
-		entry);
+	result = kgsl_mem_entry_attach_process(entry, dev_priv);
 	if (result)
 		goto error_attach;
 
@@ -2618,9 +2611,6 @@ long kgsl_ioctl_map_user_mem(struct kgsl_device_private *dev_priv,
 	trace_kgsl_mem_map(entry, param->fd);
 
 	kgsl_mem_entry_commit_process(entry);
-
-	/* put the extra refcount for kgsl_mem_entry_create() */
-	kgsl_mem_entry_put(entry);
 	return result;
 
 error_attach:
@@ -3012,11 +3002,11 @@ static struct kgsl_mem_entry *gpumem_alloc_entry(
 		entry->memdesc.priv |= KGSL_MEMDESC_SECURE;
 
 	ret = kgsl_allocate_user(dev_priv->device, &entry->memdesc,
-		size, flags);
+				private->pagetable, size, flags);
 	if (ret != 0)
 		goto err;
 
-	ret = kgsl_mem_entry_attach_process(dev_priv->device, private, entry);
+	ret = kgsl_mem_entry_attach_process(entry, dev_priv);
 	if (ret != 0) {
 		kgsl_sharedmem_free(&entry->memdesc);
 		goto err;
@@ -3074,8 +3064,6 @@ long kgsl_ioctl_gpuobj_alloc(struct kgsl_device_private *dev_priv,
 	param->mmapsize = kgsl_memdesc_footprint(&entry->memdesc);
 	param->id = entry->id;
 
-	/* put the extra refcount for kgsl_mem_entry_create() */
-	kgsl_mem_entry_put(entry);
 	return 0;
 }
 
@@ -3099,8 +3087,6 @@ long kgsl_ioctl_gpumem_alloc(struct kgsl_device_private *dev_priv,
 	param->size = (size_t) entry->memdesc.size;
 	param->flags = (unsigned int) entry->memdesc.flags;
 
-	/* put the extra refcount for kgsl_mem_entry_create() */
-	kgsl_mem_entry_put(entry);
 	return 0;
 }
 
@@ -3124,8 +3110,6 @@ long kgsl_ioctl_gpumem_alloc_id(struct kgsl_device_private *dev_priv,
 	param->mmapsize = (size_t) kgsl_memdesc_footprint(&entry->memdesc);
 	param->gpuaddr = (unsigned long) entry->memdesc.gpuaddr;
 
-	/* put the extra refcount for kgsl_mem_entry_create() */
-	kgsl_mem_entry_put(entry);
 	return 0;
 }
 
@@ -3198,7 +3182,6 @@ long kgsl_ioctl_gpuobj_set_info(struct kgsl_device_private *dev_priv,
 	struct kgsl_process_private *private = dev_priv->process_priv;
 	struct kgsl_gpuobj_set_info *param = data;
 	struct kgsl_mem_entry *entry;
-	int ret = 0;
 
 	if (param->id == 0)
 		return -EINVAL;
@@ -3211,16 +3194,12 @@ long kgsl_ioctl_gpuobj_set_info(struct kgsl_device_private *dev_priv,
 		copy_metadata(entry, param->metadata, param->metadata_len);
 
 	if (param->flags & KGSL_GPUOBJ_SET_INFO_TYPE) {
-		if (param->type <= (KGSL_MEMTYPE_MASK >> KGSL_MEMTYPE_SHIFT)) {
-			entry->memdesc.flags &= ~((uint64_t) KGSL_MEMTYPE_MASK);
-			entry->memdesc.flags |= (uint64_t)((param->type <<
-				KGSL_MEMTYPE_SHIFT) & KGSL_MEMTYPE_MASK);
-		} else
-			ret = -EINVAL;
+		entry->memdesc.flags &= ~((uint64_t) KGSL_MEMTYPE_MASK);
+		entry->memdesc.flags |= param->type << KGSL_MEMTYPE_SHIFT;
 	}
 
 	kgsl_mem_entry_put(entry);
-	return ret;
+	return 0;
 }
 
 long kgsl_ioctl_cff_syncmem(struct kgsl_device_private *dev_priv,
@@ -3447,16 +3426,16 @@ static unsigned long _gpu_set_svm_region(struct kgsl_process_private *private,
 		return ret;
 
 	entry->memdesc.gpuaddr = (uint64_t) addr;
-	entry->memdesc.pagetable = private->pagetable;
 
 	ret = kgsl_mmu_map(private->pagetable, &entry->memdesc);
 	if (ret) {
-		kgsl_mmu_put_gpuaddr(&entry->memdesc);
+		kgsl_mmu_put_gpuaddr(private->pagetable,
+				&entry->memdesc);
 		return ret;
 	}
 
-	kgsl_memfree_purge(private->pagetable, entry->memdesc.gpuaddr,
-		entry->memdesc.size);
+	kgsl_memfree_purge(private->pagetable ? private->pagetable->name : 0,
+		entry->memdesc.gpuaddr, entry->memdesc.size);
 
 	return addr;
 }
@@ -3714,14 +3693,19 @@ static int kgsl_mmap(struct file *file, struct vm_area_struct *vma)
 
 	if (cache == KGSL_CACHEMODE_WRITEBACK
 		|| cache == KGSL_CACHEMODE_WRITETHROUGH) {
+		struct scatterlist *s;
 		int i;
 		unsigned long addr = vma->vm_start;
-		struct kgsl_memdesc *m = &entry->memdesc;
 
-		for (i = 0; i < m->page_count; i++) {
-				struct page *page = m->pages[i];
+		for_each_sg(entry->memdesc.sgt->sgl, s,
+				entry->memdesc.sgt->nents, i) {
+			int j;
+			for (j = 0; j < (s->length >> PAGE_SHIFT); j++) {
+				struct page *page = sg_page(s);
+				page = nth_page(page, j);
 				vm_insert_page(vma, addr, page);
 				addr += PAGE_SIZE;
+			}
 		}
 	}
 
@@ -4076,8 +4060,6 @@ static void kgsl_core_exit(void)
 static int __init kgsl_core_init(void)
 {
 	int result = 0;
-	struct sched_param param = { .sched_priority = 2 };
-
 	/* alloc major and minor device numbers */
 	result = alloc_chrdev_region(&kgsl_driver.major, 0, KGSL_DEVICE_MAX,
 		"kgsl");
@@ -4140,18 +4122,6 @@ static int __init kgsl_core_init(void)
 	kgsl_driver.workqueue = create_singlethread_workqueue("kgsl-workqueue");
 	kgsl_driver.mem_workqueue =
 		create_singlethread_workqueue("kgsl-mementry");
-
-	init_kthread_worker(&kgsl_driver.worker);
-
-	kgsl_driver.worker_thread = kthread_run(kthread_worker_fn,
-		&kgsl_driver.worker, "kgsl_worker_thread");
-
-	if (IS_ERR(kgsl_driver.worker_thread)) {
-		pr_err("unable to start kgsl thread\n");
-		goto err;
-	}
-
-	sched_setscheduler(kgsl_driver.worker_thread, SCHED_FIFO, &param);
 
 	kgsl_events_init();
 

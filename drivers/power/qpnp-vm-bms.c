@@ -37,6 +37,8 @@
 #include <linux/batterydata-interface.h>
 #include <linux/qpnp/qpnp-revid.h>
 #include <uapi/linux/vm_bms.h>
+#include <soc/qcom/socinfo.h>
+
 
 #define _BMS_MASK(BITS, POS) \
 	((unsigned char)(((1 << (BITS)) - 1) << (POS)))
@@ -1179,6 +1181,7 @@ static int read_and_update_ocv(struct qpnp_bms_chip *chip, int batt_temp,
 	return 0;
 }
 
+#define DEFAULT_BATT_VOLTAGE (3800*1000)
 static int get_battery_voltage(struct qpnp_bms_chip *chip, int *result_uv)
 {
 	int rc;
@@ -1226,6 +1229,7 @@ static int get_batt_therm(struct qpnp_bms_chip *chip, int *batt_temp)
 					LR_MUX1_BATT_THERM, rc);
 		return rc;
 	}
+
 	pr_debug("batt_temp phy = %lld meas = 0x%llx\n",
 			result.physical, result.measurement);
 
@@ -2216,6 +2220,7 @@ static enum power_supply_property bms_power_props[] = {
 	POWER_SUPPLY_PROP_BATTERY_TYPE,
 	POWER_SUPPLY_PROP_TEMP,
 	POWER_SUPPLY_PROP_CYCLE_COUNT,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 };
 
 static int
@@ -2293,6 +2298,12 @@ static int qpnp_vm_bms_power_get_property(struct power_supply *psy,
 			val->intval = chip->charge_cycles;
 		else
 			val->intval = -EINVAL;
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		rc = get_battery_voltage(chip, &value);
+		if (rc)
+			value = DEFAULT_BATT_VOLTAGE;
+		val->intval = value;
 		break;
 	default:
 		return -EINVAL;
@@ -3768,6 +3779,11 @@ static int qpnp_vm_bms_probe(struct spmi_device *spmi)
 	struct qpnp_bms_chip *chip;
 	struct device_node *revid_dev_node;
 	int rc, vbatt = 0;
+
+	if (socinfo_get_board_ver_id() != 0) {
+		pr_info("board is :%d, return derectly!\n", socinfo_get_board_ver_id());
+		return -EINVAL;
+	}
 
 	chip = devm_kzalloc(&spmi->dev, sizeof(*chip), GFP_KERNEL);
 	if (!chip) {

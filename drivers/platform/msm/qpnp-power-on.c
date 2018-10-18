@@ -514,6 +514,71 @@ static int qpnp_pon_reset_config(struct qpnp_pon *pon,
 	return rc;
 }
 
+static int is_s3_reset_need_fix(struct qpnp_pon *pon, bool *enable)
+{
+	int rc;
+	u8 reg = 0;
+
+	rc = spmi_ext_register_readl(pon->spmi->ctrl, pon->spmi->sid,
+			QPNP_PON_S3_SRC(pon), &reg, 1);
+	if (rc) {
+		dev_err(&pon->spmi->dev,
+			"Unable to read from rc(%d)\n",
+			rc);
+		return rc;
+	}
+	if ((reg & QPNP_PON_S3_SRC_MASK) == QPNP_PON_S3_SRC_KPDPWR)
+		*enable = false;
+	else
+		*enable = true;
+	return rc;
+}
+
+static int qpnp_pon_reset_config_xvdd_hard_reset(struct qpnp_pon *pon)
+{
+	int rc;
+	u16 rst_en_reg;
+
+	if (pon->pon_ver == QPNP_PON_GEN1_V1)
+		rst_en_reg = QPNP_PON_PS_HOLD_RST_CTL(pon);
+	else
+		rst_en_reg = QPNP_PON_PS_HOLD_RST_CTL2(pon);
+
+	rc = qpnp_pon_masked_write(pon, rst_en_reg, QPNP_PON_RESET_EN, 0);
+	if (rc){
+		dev_err(&pon->spmi->dev,
+			"Unable to write to addr=%hx, rc(%d)\n",
+			rst_en_reg, rc);
+		return rc;
+	}
+
+	/*
+	 * We need 10 sleep clock cycles here. But since the clock is
+	 * internally generated, we need to add 50% tolerance to be
+	 * conservative.
+	 */
+	udelay(500);
+
+	rc = qpnp_pon_masked_write(pon, QPNP_PON_PS_HOLD_RST_CTL(pon),
+				   QPNP_PON_POWER_OFF_MASK, 0x09);
+	if (rc) {
+		dev_err(&pon->spmi->dev,
+			"Unable to write to addr=%x, rc(%d)\n",
+				QPNP_PON_PS_HOLD_RST_CTL(pon), rc);
+		return rc;
+	}
+	rc = qpnp_pon_masked_write(pon, rst_en_reg, QPNP_PON_RESET_EN,
+						    QPNP_PON_RESET_EN);
+	if (rc) {
+		dev_err(&pon->spmi->dev,
+			"Unable to write to addr=%hx, rc(%d)\n",
+			rst_en_reg, rc);
+		return rc;
+	}
+
+	return rc;
+}
+
 /**
  * qpnp_pon_system_pwr_off - Configure system-reset PMIC for shutdown or reset
  * @type: Determines the type of power off to perform - shutdown, reset, etc
@@ -531,11 +596,23 @@ int qpnp_pon_system_pwr_off(enum pon_power_off_type type)
 	struct qpnp_pon *pon = sys_reset_dev;
 	struct qpnp_pon *tmp;
 	unsigned long flags;
+	bool s3_reset_enable;
 
 	if (!pon)
 		return -ENODEV;
+	rc = is_s3_reset_need_fix(pon,&s3_reset_enable);
+	if(rc){
+		dev_err(&pon->spmi->dev, "Error read s3 reset register rc: %d\n",
+			rc);
+		return rc;
+	}
+	if (!s3_reset_enable) {
+		rc = qpnp_pon_reset_config(pon, type);
+	} else {
+		pr_info("detect s3 reset config problem, set to xvdd hard reset\n");
+		rc = qpnp_pon_reset_config_xvdd_hard_reset(pon);
+	}
 
-	rc = qpnp_pon_reset_config(pon, type);
 	if (rc) {
 		dev_err(&pon->spmi->dev, "Error configuring main PON rc: %d\n",
 			rc);
@@ -1925,6 +2002,66 @@ static int read_gen2_pon_off_reason(struct qpnp_pon *pon, u16 *reason,
 	}
 
 	return 0;
+}
+
+static int qpnp_read_wrapper(struct qpnp_pon *pon, u8 *val,
+					u16 base, int count)
+{
+	int rc;
+	struct spmi_device *spmi = pon->spmi;
+
+	rc = spmi_ext_register_readl(spmi->ctrl, spmi->sid, base, val, count);
+	if (rc)
+		pr_err("SPMI read failed rc=%d\n", rc);
+
+	return rc;
+}
+
+static int qpnp_write_wrapper(struct qpnp_pon *pon, u8 *val,
+			u16 base, int count)
+{
+	int rc;
+	struct spmi_device *spmi = pon->spmi;
+
+	rc = spmi_ext_register_writel(spmi->ctrl, spmi->sid, base, val, count);
+	if (rc)
+		pr_err("SPMI write failed rc=%d\n", rc);
+
+	return rc;
+}
+
+static int qpnp_masked_write_base(struct qpnp_pon *pon, u16 addr,
+							u8 mask, u8 val)
+{
+	int rc;
+	u8 reg;
+
+	rc = qpnp_read_wrapper(pon, &reg, addr, 1);
+	if (rc) {
+		pr_err("read failed addr = %03X, rc = %d\n", addr, rc);
+		return rc;
+	}
+	reg &= ~mask;
+	reg |= val & mask;
+	rc = qpnp_write_wrapper(pon, &reg, addr, 1);
+	if (rc)
+		pr_err("write failed addr = %03X, val = %02x, mask = %02x, reg = %02x, rc = %d\n",
+					addr, val, mask, reg, rc);
+
+	return rc;
+}
+
+#define PON_TRIGGER_EN_ADDRESS 0x880
+#define CBLPWR_MASK BIT(6)
+int set_cblpwr_pon_disable(void)
+{
+	int rc;
+
+	rc = qpnp_masked_write_base(sys_reset_dev, PON_TRIGGER_EN_ADDRESS, CBLPWR_MASK, 0);
+	if (rc)
+		pr_err("Unable to disable cblpwr rc=%d\n", rc);
+
+	return rc;
 }
 
 static int qpnp_pon_probe(struct spmi_device *spmi)

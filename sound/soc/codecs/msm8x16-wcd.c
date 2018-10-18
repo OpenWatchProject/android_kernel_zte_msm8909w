@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2015-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -79,6 +79,8 @@
  * after Sub System Restart
  */
 #define ADSP_STATE_READY_TIMEOUT_MS 50
+
+static bool current_ext_spk_pa_state = false;
 
 #define HPHL_PA_DISABLE (0x01 << 1)
 #define HPHR_PA_DISABLE (0x01 << 2)
@@ -1152,25 +1154,17 @@ static int __msm8x16_wcd_reg_read(struct snd_soc_codec *codec,
 	else if (MSM8X16_WCD_IS_DIGITAL_REG(reg)) {
 		mutex_lock(&pdata->cdc_mclk_mutex);
 		if (atomic_read(&pdata->mclk_enabled) == false) {
-			switch (q6core_get_avs_version()) {
-			case (Q6_SUBSYS_AVS2_6):
+			if (pdata->afe_clk_ver == AFE_CLK_VERSION_V1) {
 				pdata->digital_cdc_clk.clk_val =
 							pdata->mclk_freq;
 				ret = afe_set_digital_codec_core_clock(
 						AFE_PORT_ID_PRIMARY_MI2S_RX,
 						&pdata->digital_cdc_clk);
-				break;
-			case (Q6_SUBSYS_AVS2_7):
-			case (Q6_SUBSYS_AVS2_8):
+			} else {
 				pdata->digital_cdc_core_clk.enable = 1;
 				ret = afe_set_lpass_clock_v2(
 						AFE_PORT_ID_PRIMARY_MI2S_RX,
 						&pdata->digital_cdc_core_clk);
-				break;
-			case (Q6_SUBSYS_INVALID):
-			default:
-				pr_err("%s: INVALID AVS IMAGE\n", __func__);
-				break;
 			}
 			if (ret < 0) {
 				pr_err("failed to enable the MCLK\n");
@@ -1217,25 +1211,17 @@ static int __msm8x16_wcd_reg_write(struct snd_soc_codec *codec,
 		mutex_lock(&pdata->cdc_mclk_mutex);
 		if (atomic_read(&pdata->mclk_enabled) == false) {
 			pr_debug("enable MCLK for AHB write\n");
-			switch (q6core_get_avs_version()) {
-			case (Q6_SUBSYS_AVS2_6):
+			if (pdata->afe_clk_ver == AFE_CLK_VERSION_V1) {
 				pdata->digital_cdc_clk.clk_val =
 							pdata->mclk_freq;
 				ret = afe_set_digital_codec_core_clock(
 						AFE_PORT_ID_PRIMARY_MI2S_RX,
 						&pdata->digital_cdc_clk);
-				break;
-			case (Q6_SUBSYS_AVS2_7):
-			case (Q6_SUBSYS_AVS2_8):
+			} else {
 				pdata->digital_cdc_core_clk.enable = 1;
 				ret = afe_set_lpass_clock_v2(
 						AFE_PORT_ID_PRIMARY_MI2S_RX,
 						&pdata->digital_cdc_core_clk);
-				break;
-			case (Q6_SUBSYS_INVALID):
-			default:
-				pr_err("%s: INVALID AVS IMAGE\n", __func__);
-				break;
 			}
 			if (ret < 0) {
 				pr_err("failed to enable the MCLK\n");
@@ -1354,7 +1340,8 @@ static void msm8x16_wcd_boost_on(struct snd_soc_codec *codec)
 	pr_debug("%s: LDO state: 0x%x\n", __func__, dest);
 
 	if ((dest & MASK_MSB_BIT) == 0) {
-		pr_debug("LDO7 not enabled\n");
+		pr_err("LDO7 not enabled return!\n");
+		return;
 	}
 	ret = spmi_ext_register_readl(wcd->spmi->ctrl, PMIC_SLAVE_ID_0,
 						PMIC_MBG_OK, &dest, 1);
@@ -2081,6 +2068,43 @@ static int msm8x16_wcd_pa_gain_put(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 
+static int msm8x16_wcd_ext_spk_get(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
+
+	if (current_ext_spk_pa_state == false) {
+		ucontrol->value.integer.value[0] = 0;
+	} else if (current_ext_spk_pa_state == true) {
+		ucontrol->value.integer.value[0] = 1;
+	} else {
+		dev_err(codec->dev, "%s: ERROR: Unsupported Speaker ext = %d\n", __func__, current_ext_spk_pa_state);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int msm8x16_wcd_ext_spk_set(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_value *ucontrol)
+{
+	switch (ucontrol->value.integer.value[0]) {
+	case 0:
+		if (gpio_is_valid(ext_spk_pa_gpio)) {
+			gpio_direction_output(ext_spk_pa_gpio, 0);
+			current_ext_spk_pa_state = false;
+		}
+		break;
+	case 1:
+		if (gpio_is_valid(ext_spk_pa_gpio)) {
+			gpio_direction_output(ext_spk_pa_gpio, 1);
+			current_ext_spk_pa_state = true;
+		}
+		break;
+	default:
+		return -EINVAL;
+	}
+	return 0;
+}
 
 static int msm8x16_wcd_boost_option_get(struct snd_kcontrol *kcontrol,
 				struct snd_ctl_elem_value *ucontrol)
@@ -2383,6 +2407,12 @@ static const struct soc_enum msm8x16_wcd_loopback_mode_ctl_enum[] = {
 		SOC_ENUM_SINGLE_EXT(2, msm8x16_wcd_loopback_mode_ctrl_text),
 };
 
+static const char * const msm8x16_wcd_ext_spk_ctrl_text[] = {
+		"DISABLE", "ENABLE"};
+static const struct soc_enum msm8x16_wcd_ext_spk_ctl_enum[] = {
+		SOC_ENUM_SINGLE_EXT(2, msm8x16_wcd_ext_spk_ctrl_text),
+};
+
 static const char * const msm8x16_wcd_ear_pa_boost_ctrl_text[] = {
 		"DISABLE", "ENABLE"};
 static const struct soc_enum msm8x16_wcd_ear_pa_boost_ctl_enum[] = {
@@ -2443,6 +2473,9 @@ static const struct snd_kcontrol_new msm8x16_wcd_snd_controls[] = {
 
 	SOC_ENUM_EXT("EAR PA Gain", msm8x16_wcd_ear_pa_gain_enum[0],
 		msm8x16_wcd_pa_gain_get, msm8x16_wcd_pa_gain_put),
+
+	SOC_ENUM_EXT("Speaker Ext", msm8x16_wcd_ext_spk_ctl_enum[0],
+		msm8x16_wcd_ext_spk_get, msm8x16_wcd_ext_spk_set),
 
 	SOC_ENUM_EXT("Ext Spk Boost", msm8x16_wcd_ext_spk_boost_ctl_enum[0],
 		msm8x16_wcd_ext_spk_boost_get, msm8x16_wcd_ext_spk_boost_set),
@@ -5548,6 +5581,7 @@ static int msm8x16_wcd_codec_probe(struct snd_soc_codec *codec)
 			, GFP_KERNEL);
 	if (!msm8x16_wcd_priv->fw_data) {
 		iounmap(msm8x16_wcd->dig_base);
+		cancel_delayed_work_sync(&msm8x16_wcd_priv->work);
 		kfree(msm8x16_wcd_priv);
 		return -ENOMEM;
 	}
@@ -5682,24 +5716,16 @@ int msm8x16_wcd_suspend(struct snd_soc_codec *codec)
 				&pdata->disable_mclk_work);
 		mutex_lock(&pdata->cdc_mclk_mutex);
 		if (atomic_read(&pdata->mclk_enabled) == true) {
-			switch (q6core_get_avs_version()) {
-			case (Q6_SUBSYS_AVS2_6):
+			if (pdata->afe_clk_ver == AFE_CLK_VERSION_V1) {
 				pdata->digital_cdc_clk.clk_val = 0;
 				afe_set_digital_codec_core_clock(
 						AFE_PORT_ID_PRIMARY_MI2S_RX,
 						&pdata->digital_cdc_clk);
-				break;
-			case (Q6_SUBSYS_AVS2_7):
-			case (Q6_SUBSYS_AVS2_8):
+			} else {
 				pdata->digital_cdc_core_clk.enable = 0;
 				afe_set_lpass_clock_v2(
 						AFE_PORT_ID_PRIMARY_MI2S_RX,
 						&pdata->digital_cdc_core_clk);
-				break;
-			case (Q6_SUBSYS_INVALID):
-			default:
-				pr_err("%s: INVALID AVS IMAGE\n", __func__);
-				break;
 			}
 			atomic_set(&pdata->mclk_enabled, false);
 		}
@@ -5873,7 +5899,7 @@ static int msm8x16_wcd_device_init(struct msm8x16_wcd *msm8x16)
 
 static int msm8x16_wcd_spmi_probe(struct spmi_device *spmi)
 {
-	int ret = 0, ret1 = 0;
+	int ret = 0;
 	struct msm8x16_wcd *msm8x16 = NULL;
 	struct msm8x16_wcd_pdata *pdata;
 	struct resource *wcd_resource;
@@ -5890,13 +5916,6 @@ static int msm8x16_wcd_spmi_probe(struct spmi_device *spmi)
 		return -EPROBE_DEFER;
 	}
 
-	ret1 = core_get_adsp_ver();
-	if (ret1 < 0) {
-		ret = -EPROBE_DEFER;
-		dev_dbg(&spmi->dev, "%s: Get adsp version failed (%d)\n",
-						__func__, ret);
-		goto rtn;
-	}
 	wcd_resource = spmi_get_resource(spmi, NULL, IORESOURCE_MEM, 0);
 	if (!wcd_resource) {
 		dev_err(&spmi->dev, "Unable to get Tombak base address\n");

@@ -127,6 +127,12 @@
 			no-map;
 		};
 
+		pstore_mem: pstore_region@0 {
+			reg = <0x0 0x8d700000 0x0 0x00100000>;
+			compatible = "removed-pstore-pool";
+			no-map;
+		};
+
 		venus_qseecom_mem: venus_qseecom_region@0 {
 			compatible = "shared-dma-pool";
 			reusable;
@@ -453,6 +459,20 @@
 		sensor_information9: qcom,sensor-information-9 {
 			qcom,sensor-type = "adc";
 			qcom,sensor-name = "xo_therm_buf";
+		};
+
+		sensor_information10: qcom,sensor-information-10 {
+			qcom,sensor-type = "adc";
+			qcom,sensor-name = "mpp2_adc";
+		};
+
+		sensor_information11: qcom,sensor-information-11 {
+			qcom,sensor-type = "adc";
+			qcom,sensor-name = "mpp4_adc";
+		};
+		sensor_information12: qcom,sensor-information-12 {
+			qcom,sensor-type = "adc";
+			qcom,sensor-name = "batt_therm";
 		};
 	};
 

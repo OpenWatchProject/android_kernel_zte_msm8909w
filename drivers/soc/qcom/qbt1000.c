@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -58,7 +58,6 @@ enum sensor_connection_types {
  * user space will provide new value upon tz app load
  */
 static uint32_t g_app_buf_size = SZ_256K;
-static char const *const FP_APP_NAME = "fingerpr";
 
 struct qbt1000_drvdata {
 	struct class	*qbt1000_class;
@@ -84,7 +83,6 @@ struct qbt1000_drvdata {
 	uint32_t	ssc_subsys_id;
 	uint32_t	ssc_spi_port;
 	uint32_t	ssc_spi_port_slave_index;
-	struct qseecom_handle *app_handle;
 };
 
 /**
@@ -105,16 +103,14 @@ static int get_cmd_rsp_buffers(struct qseecom_handle *hdl,
 	uint32_t *rsp_len)
 {
 	/* 64 bytes alignment for QSEECOM */
-	uint64_t aligned_cmd_len = ALIGN((uint64_t)*cmd_len, 64);
-	uint64_t aligned_rsp_len = ALIGN((uint64_t)*rsp_len, 64);
+	*cmd_len = ALIGN(*cmd_len, 64);
+	*rsp_len = ALIGN(*rsp_len, 64);
 
-	if ((aligned_rsp_len + aligned_cmd_len) > (uint64_t)g_app_buf_size)
+	if ((*rsp_len + *cmd_len) > g_app_buf_size)
 		return -ENOMEM;
 
 	*cmd = hdl->sbuf;
-	*cmd_len = aligned_cmd_len;
 	*rsp = hdl->sbuf + *cmd_len;
-	*rsp_len = aligned_rsp_len;
 
 	return 0;
 }
@@ -790,40 +786,17 @@ static long qbt1000_ioctl(struct file *file, unsigned cmd, unsigned long arg)
 			goto end;
 		}
 
-		if (strcmp(app.name, FP_APP_NAME)) {
-			dev_err(drvdata->dev, "%s: Invalid app name\n",
-				__func__);
-			rc = -EINVAL;
-			goto end;
-		}
-
-		if (drvdata->app_handle) {
-			dev_err(drvdata->dev, "%s: LOAD app already loaded, unloading first\n",
-				__func__);
-			rc = qseecom_shutdown_app(&drvdata->app_handle);
-			if (rc != 0) {
-				dev_err(drvdata->dev, "%s: LOAD current app failed to shutdown\n",
-					  __func__);
-				goto end;
-			}
-		}
-
-		app.name[MAX_NAME_SIZE - 1] = '\0';
-
 		/* start the TZ app */
-		rc = qseecom_start_app(&drvdata->app_handle,
-				app.name, app.size);
+		rc = qseecom_start_app(&app_handle, app.name, app.size);
 		if (rc == 0) {
 			g_app_buf_size = app.size;
 		} else {
-			dev_err(drvdata->dev, "%s: Fingerprint Trusted App failed to load\n",
-				__func__);
+			dev_err(drvdata->dev, "%s: App %s failed to load\n",
+				__func__, app.name);
 			goto end;
 		}
 
-		/* copy a fake app handle to user */
-		app_handle = drvdata->app_handle ?
-			(struct qseecom_handle *)123456 : 0;
+		/* copy the app handle to user */
 		rc = copy_to_user((void __user *)app.app_handle, &app_handle,
 			sizeof(*app.app_handle));
 
@@ -840,7 +813,7 @@ static long qbt1000_ioctl(struct file *file, unsigned cmd, unsigned long arg)
 	case QBT1000_UNLOAD_APP:
 	{
 		struct qbt1000_app app;
-		struct qseecom_handle *app_handle = 0;
+		struct qseecom_handle *app_handle;
 
 		if (copy_from_user(&app, priv_arg,
 			sizeof(app)) != 0) {
@@ -870,14 +843,14 @@ static long qbt1000_ioctl(struct file *file, unsigned cmd, unsigned long arg)
 		}
 
 		/* if the app hasn't been loaded already, return err */
-		if (!drvdata->app_handle) {
+		if (!app_handle) {
 			dev_err(drvdata->dev, "%s: App not loaded\n",
 				__func__);
 			rc = -EINVAL;
 			goto end;
 		}
 
-		rc = qseecom_shutdown_app(&drvdata->app_handle);
+		rc = qseecom_shutdown_app(&app_handle);
 		if (rc != 0) {
 			dev_err(drvdata->dev, "%s: App failed to shutdown\n",
 				__func__);
@@ -918,7 +891,7 @@ static long qbt1000_ioctl(struct file *file, unsigned cmd, unsigned long arg)
 		}
 
 		/* if the app hasn't been loaded already, return err */
-		if (!drvdata->app_handle) {
+		if (!tzcmd.app_handle) {
 			dev_err(drvdata->dev, "%s: App not loaded\n",
 				__func__);
 			rc = -EINVAL;
@@ -928,20 +901,13 @@ static long qbt1000_ioctl(struct file *file, unsigned cmd, unsigned long arg)
 		/* init command and response buffers and align lengths */
 		aligned_cmd_len = tzcmd.req_buf_len;
 		aligned_rsp_len = tzcmd.rsp_buf_len;
-		rc = get_cmd_rsp_buffers(drvdata->app_handle,
+		rc = get_cmd_rsp_buffers(tzcmd.app_handle,
 			(void **)&aligned_cmd,
 			&aligned_cmd_len,
 			(void **)&aligned_rsp,
 			&aligned_rsp_len);
 		if (rc != 0)
 			goto end;
-
-		if (!aligned_cmd) {
-			dev_err(drvdata->dev, "%s: Null command buffer\n",
-				__func__);
-			rc = -EINVAL;
-			goto end;
-		}
 
 		rc = copy_from_user(aligned_cmd, (void __user *)tzcmd.req_buf,
 				tzcmd.req_buf_len);
@@ -953,7 +919,7 @@ static long qbt1000_ioctl(struct file *file, unsigned cmd, unsigned long arg)
 		}
 
 		/* send cmd to TZ */
-		rc = qseecom_send_command(drvdata->app_handle,
+		rc = qseecom_send_command(tzcmd.app_handle,
 			aligned_cmd,
 			aligned_cmd_len,
 			aligned_rsp,

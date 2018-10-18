@@ -726,6 +726,7 @@ static struct sync_fence *__create_fence(struct msm_fb_data_type *mfd,
 		goto end;
 	}
 
+	sync_fence_install(sync_fence, *fence_fd);
 end:
 	return sync_fence;
 }
@@ -798,9 +799,6 @@ static int __handle_buffer_fences(struct msm_fb_data_type *mfd,
 		ret = PTR_ERR(retire_fence);
 		goto retire_fence_err;
 	}
-
-	sync_fence_install(release_fence, commit->release_fence);
-	sync_fence_install(retire_fence, commit->retire_fence);
 
 	mutex_unlock(&sync_pt_data->sync_mutex);
 	return ret;
@@ -1527,12 +1525,6 @@ int mdss_mdp_layer_pre_commit_wfd(struct msm_fb_data_type *mfd,
 		wfd = mdp5_data->wfd;
 		output_layer = commit->output_layer;
 
-		if (output_layer->buffer.plane_count > MAX_PLANES) {
-			pr_err("Output buffer plane_count exceeds MAX_PLANES limit:%d\n",
-					output_layer->buffer.plane_count);
-			return -EINVAL;
-		}
-
 		data = mdss_mdp_wfd_add_data(wfd, output_layer);
 		if (IS_ERR_OR_NULL(data))
 			return PTR_ERR(data);
@@ -1563,14 +1555,6 @@ int mdss_mdp_layer_pre_commit_wfd(struct msm_fb_data_type *mfd,
 		sync_pt_data = &mfd->mdp_sync_pt_data;
 		mutex_lock(&sync_pt_data->sync_mutex);
 		count = sync_pt_data->acq_fen_cnt;
-
-		if (count >= MDP_MAX_FENCE_FD) {
-			pr_err("Reached maximum possible value for fence count\n");
-			mutex_unlock(&sync_pt_data->sync_mutex);
-			rc = -EINVAL;
-			goto input_layer_err;
-		}
-
 		sync_pt_data->acq_fen[count] = fence;
 		sync_pt_data->acq_fen_cnt++;
 		mutex_unlock(&sync_pt_data->sync_mutex);

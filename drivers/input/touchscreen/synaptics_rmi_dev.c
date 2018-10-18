@@ -340,9 +340,10 @@ static ssize_t rmidev_read(struct file *filp, char __user *buf,
 		*f_pos += retval;
 
 clean_up:
-	kfree(tmpbuf);
+        kfree(tmpbuf);
 unlock:
 	mutex_unlock(&(dev_data->file_mutex));
+
 	return retval;
 }
 

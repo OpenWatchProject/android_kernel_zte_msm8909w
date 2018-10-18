@@ -13,7 +13,7 @@
 
 #include "msm_ba_debug.h"
 
-#define MAX_DBG_BUF_SIZE 1008
+#define MAX_DBG_BUF_SIZE 4096
 
 int msm_ba_debug = BA_ERR | BA_WARN;
 int msm_ba_debug_out = BA_OUT_PRINTK;
@@ -24,9 +24,11 @@ struct debug_buffer {
 	u32 filled_size;
 };
 
+static struct debug_buffer dbg_buf;
+
 #define INIT_DBG_BUF(__buf) ({ \
-	__buf->curr = __buf->ptr;\
-	__buf->filled_size = 0; \
+	__buf.curr = __buf.ptr;\
+	__buf.filled_size = 0; \
 })
 
 static int dev_info_open(struct inode *inode, struct file *file)
@@ -56,32 +58,19 @@ static ssize_t dev_info_read(struct file *file, char __user *buf,
 		size_t count, loff_t *ppos)
 {
 	struct msm_ba_dev *dev_ctxt = file->private_data;
-	struct debug_buffer *dbg_buf = NULL;
-	ssize_t size = 0;
 
 	if (!dev_ctxt) {
-		dprintk(BA_ERR, "Invalid params, dev: 0x%pK", dev_ctxt);
+		dprintk(BA_ERR, "Invalid params, dev: 0x%p", dev_ctxt);
 		return 0;
 	}
-
-	dbg_buf = kmalloc(sizeof(struct debug_buffer), GFP_KERNEL);
-	if (NULL == dbg_buf) {
-		dprintk(BA_ERR, "%s: Memory allocation failed for dbg_buf", __func__);
-		return 0;
-	}
-
 	INIT_DBG_BUF(dbg_buf);
-	write_str(dbg_buf, "===============================");
-	write_str(dbg_buf, "DEV: 0x%pK", dev_ctxt);
-	write_str(dbg_buf, "===============================");
-	write_str(dbg_buf, "state: %d", dev_ctxt->state);
+	write_str(&dbg_buf, "===============================");
+	write_str(&dbg_buf, "DEV: 0x%p", dev_ctxt);
+	write_str(&dbg_buf, "===============================");
+	write_str(&dbg_buf, "state: %d", dev_ctxt->state);
 
-	size = simple_read_from_buffer(buf, count, ppos,
-			dbg_buf->ptr, dbg_buf->filled_size);
-
-	kfree(dbg_buf);
-
-	return size;
+	return simple_read_from_buffer(buf, count, ppos,
+			dbg_buf.ptr, dbg_buf.filled_size);
 }
 
 static const struct file_operations dev_info_fops = {
@@ -104,7 +93,7 @@ struct dentry *msm_ba_debugfs_init_drv(void)
 	struct dentry *f = debugfs_create_##__type(__name, S_IRUGO | S_IWUSR, \
 		dir, __value);                                                \
 	if (IS_ERR_OR_NULL(f)) {                                              \
-		dprintk(BA_ERR, "Failed creating debugfs file '%pKd/%s'",  \
+		dprintk(BA_ERR, "Failed creating debugfs file '%pd/%s'",  \
 			dir, __name);                                         \
 		f = NULL;                                                     \
 	}                                                                     \
@@ -137,11 +126,11 @@ struct dentry *msm_ba_debugfs_init_dev(struct msm_ba_dev *dev_ctxt,
 	char debugfs_name[MAX_DEBUGFS_NAME];
 
 	if (!dev_ctxt) {
-		dprintk(BA_ERR, "Invalid params, core: %pK", dev_ctxt);
+		dprintk(BA_ERR, "Invalid params, core: %p", dev_ctxt);
 		goto failed_create_dir;
 	}
 
-	snprintf(debugfs_name, MAX_DEBUGFS_NAME, "dev_%pK", dev_ctxt);
+	snprintf(debugfs_name, MAX_DEBUGFS_NAME, "dev_%p", dev_ctxt);
 	dir = debugfs_create_dir(debugfs_name, parent);
 	if (!dir) {
 		dprintk(BA_ERR, "Failed to create debugfs for msm_ba");
@@ -166,34 +155,21 @@ static ssize_t inst_info_read(struct file *file, char __user *buf,
 		size_t count, loff_t *ppos)
 {
 	struct msm_ba_inst *inst = file->private_data;
-	struct debug_buffer *dbg_buf = NULL;
-	ssize_t size = 0;
 
 	if (!inst) {
-		dprintk(BA_ERR, "Invalid params, dev: %pK", inst);
+		dprintk(BA_ERR, "Invalid params, dev: %p", inst);
 		return 0;
 	}
-
-	dbg_buf = kmalloc(sizeof(struct debug_buffer), GFP_KERNEL);
-	if (NULL == dbg_buf) {
-		dprintk(BA_ERR, "%s: Memory allocation failed for dbg_buf", __func__);
-		return 0;
-	}
-
 	INIT_DBG_BUF(dbg_buf);
-	write_str(dbg_buf, "===============================");
-	write_str(dbg_buf, "INSTANCE: %pK (%s)", inst,
+	write_str(&dbg_buf, "===============================");
+	write_str(&dbg_buf, "INSTANCE: %p (%s)", inst,
 								"BA device");
-	write_str(dbg_buf, "===============================");
-	write_str(dbg_buf, "dev: %pK", inst->dev_ctxt);
-	write_str(dbg_buf, "state: %d", inst->state);
+	write_str(&dbg_buf, "===============================");
+	write_str(&dbg_buf, "dev: %p", inst->dev_ctxt);
+	write_str(&dbg_buf, "state: %d", inst->state);
 
-	size = simple_read_from_buffer(buf, count, ppos,
-		dbg_buf->ptr, dbg_buf->filled_size);
-
-	kfree(dbg_buf);
-
-	return size;
+	return simple_read_from_buffer(buf, count, ppos,
+		dbg_buf.ptr, dbg_buf.filled_size);
 }
 
 static const struct file_operations inst_info_fops = {
@@ -208,10 +184,10 @@ struct dentry *msm_ba_debugfs_init_inst(struct msm_ba_inst *inst,
 	char debugfs_name[MAX_DEBUGFS_NAME];
 
 	if (!inst) {
-		dprintk(BA_ERR, "Invalid params, inst: %pK", inst);
+		dprintk(BA_ERR, "Invalid params, inst: %p", inst);
 		goto failed_create_dir;
 	}
-	snprintf(debugfs_name, MAX_DEBUGFS_NAME, "inst_%pK", inst);
+	snprintf(debugfs_name, MAX_DEBUGFS_NAME, "inst_%p", inst);
 	dir = debugfs_create_dir(debugfs_name, parent);
 	if (!dir) {
 		dprintk(BA_ERR, "Failed to create debugfs for msm_ba");

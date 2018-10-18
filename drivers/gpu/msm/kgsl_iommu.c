@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -1157,16 +1157,17 @@ static int _setstate_alloc(struct kgsl_device *device,
 {
 	int ret;
 
-	ret = kgsl_sharedmem_alloc_contig(device, &iommu->setstate, PAGE_SIZE);
+	ret = kgsl_sharedmem_alloc_contig(device, &iommu->setstate, NULL,
+		PAGE_SIZE);
+	if (ret)
+		return ret;
 
-	if (!ret) {
-		/* Mark the setstate memory as read only */
-		iommu->setstate.flags |= KGSL_MEMFLAGS_GPUREADONLY;
+	/* Mark the setstate memory as read only */
+	iommu->setstate.flags |= KGSL_MEMFLAGS_GPUREADONLY;
 
-		kgsl_sharedmem_set(device, &iommu->setstate, 0, 0, PAGE_SIZE);
-	}
+	kgsl_sharedmem_set(device, &iommu->setstate, 0, 0, PAGE_SIZE);
 
-	return ret;
+	return 0;
 }
 
 static int kgsl_iommu_init(struct kgsl_mmu *mmu)
@@ -1407,7 +1408,7 @@ static int _iommu_map_guard_page(struct kgsl_pagetable *pt,
 
 		if (!kgsl_secure_guard_page_memdesc.sgt) {
 			if (kgsl_allocate_user(KGSL_MMU_DEVICE(pt->mmu),
-					&kgsl_secure_guard_page_memdesc,
+					&kgsl_secure_guard_page_memdesc, pt,
 					sgp_size, KGSL_MEMFLAGS_SECURE)) {
 				KGSL_CORE_ERR(
 					"Secure guard page alloc failed\n");
@@ -1433,7 +1434,6 @@ kgsl_iommu_map(struct kgsl_pagetable *pt,
 	uint64_t addr = memdesc->gpuaddr;
 	uint64_t size = memdesc->size;
 	unsigned int flags;
-	struct sg_table *sgt = NULL;
 
 	BUG_ON(NULL == pt->priv);
 
@@ -1446,33 +1446,13 @@ kgsl_iommu_map(struct kgsl_pagetable *pt,
 	if (memdesc->priv & KGSL_MEMDESC_PRIVILEGED)
 		flags |= IOMMU_PRIV;
 
-	/*
-	 * For paged memory allocated through kgsl, memdesc->pages is not NULL.
-	 * Allocate sgt here just for its map operation. Contiguous memory
-	 * already has its sgt, so no need to allocate it here.
-	 */
-	if (memdesc->pages != NULL) {
-		sgt = kgsl_alloc_sgt_from_pages(memdesc);
-		memdesc->sgt = sgt;
-	}
-
-	if (IS_ERR(sgt))
-		return PTR_ERR(sgt);
-
 	ret = _iommu_map_sg_sync_pc(pt, addr, memdesc, flags);
-
 	if (ret)
-		goto done;
+		return ret;
 
 	ret = _iommu_map_guard_page(pt, memdesc, addr + size, flags);
 	if (ret)
 		_iommu_unmap_sync_pc(pt, memdesc, addr, size);
-
-done:
-	if (memdesc->pages != NULL) {
-		kgsl_free_sgt(sgt);
-		memdesc->sgt = NULL;
-	}
 
 	return ret;
 }
@@ -1987,27 +1967,23 @@ static int kgsl_iommu_get_gpuaddr(struct kgsl_pagetable *pagetable,
 	}
 
 	ret = _insert_gpuaddr(pagetable, addr, size);
-	if (ret == 0) {
+	if (ret == 0)
 		memdesc->gpuaddr = addr;
-		memdesc->pagetable = pagetable;
-	}
 
 out:
 	spin_unlock(&pagetable->lock);
 	return ret;
 }
 
-static void kgsl_iommu_put_gpuaddr(struct kgsl_memdesc *memdesc)
+static void kgsl_iommu_put_gpuaddr(struct kgsl_pagetable *pagetable,
+		struct kgsl_memdesc *memdesc)
 {
-	if (memdesc->pagetable == NULL)
-		return;
+	spin_lock(&pagetable->lock);
 
-	spin_lock(&memdesc->pagetable->lock);
-
-	if (_remove_gpuaddr(memdesc->pagetable, memdesc->gpuaddr))
+	if (_remove_gpuaddr(pagetable, memdesc->gpuaddr))
 		BUG();
 
-	spin_unlock(&memdesc->pagetable->lock);
+	spin_unlock(&pagetable->lock);
 }
 
 static int kgsl_iommu_svm_range(struct kgsl_pagetable *pagetable,

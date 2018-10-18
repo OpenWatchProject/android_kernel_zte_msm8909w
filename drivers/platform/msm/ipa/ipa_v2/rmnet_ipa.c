@@ -71,7 +71,6 @@ static void *subsys_notify_handle;
 
 u32 apps_to_ipa_hdl, ipa_to_apps_hdl; /* get handler from ipa */
 static struct mutex ipa_to_apps_pipe_handle_guard;
-static struct mutex add_mux_channel_lock;
 static int wwan_add_ul_flt_rule_to_ipa(void);
 static int wwan_del_ul_flt_rule_to_ipa(void);
 static void ipa_wwan_msg_free_cb(void*, u32, u32);
@@ -395,15 +394,12 @@ int copy_ul_filter_rule_to_ipa(struct ipa_install_fltr_rule_req_msg_v01
 {
 	int i, j;
 
-	/* prevent multi-threads accessing num_q6_rule */
-	mutex_lock(&add_mux_channel_lock);
 	if (rule_req->filter_spec_list_valid == true) {
 		num_q6_rule = rule_req->filter_spec_list_len;
 		IPAWANDBG("Received (%d) install_flt_req\n", num_q6_rule);
 	} else {
 		num_q6_rule = 0;
 		IPAWANERR("got no UL rules from modem\n");
-		mutex_unlock(&add_mux_channel_lock);
 		return -EINVAL;
 	}
 
@@ -597,11 +593,9 @@ failure:
 	num_q6_rule = 0;
 	memset(ipa_qmi_ctx->q6_ul_filter_rule, 0,
 		sizeof(ipa_qmi_ctx->q6_ul_filter_rule));
-	mutex_unlock(&add_mux_channel_lock);
 	return -EINVAL;
 
 success:
-	mutex_unlock(&add_mux_channel_lock);
 	return 0;
 }
 
@@ -633,8 +627,7 @@ static int wwan_add_ul_flt_rule_to_ipa(void)
 	param->global = false;
 	param->num_rules = (uint8_t)1;
 
-	mutex_lock(&ipa_qmi_lock);
-	for (i = 0; i < num_q6_rule && (ipa_qmi_ctx != NULL); i++) {
+	for (i = 0; i < num_q6_rule; i++) {
 		param->ip = ipa_qmi_ctx->q6_ul_filter_rule[i].ip;
 		memset(&flt_rule_entry, 0, sizeof(struct ipa_flt_rule_add));
 		flt_rule_entry.at_rear = true;
@@ -662,14 +655,12 @@ static int wwan_add_ul_flt_rule_to_ipa(void)
 				param->rules[0].flt_rule_hdl;
 		}
 	}
-	mutex_unlock(&ipa_qmi_lock);
 
 	/* send ipa_fltr_installed_notif_req_msg_v01 to Q6*/
 	req->source_pipe_index =
 		ipa2_get_ep_mapping(IPA_CLIENT_APPS_LAN_WAN_PROD);
 	req->install_status = QMI_RESULT_SUCCESS_V01;
 	req->filter_index_list_len = num_q6_rule;
-	mutex_lock(&ipa_qmi_lock);
 	for (i = 0; i < num_q6_rule; i++) {
 		if (ipa_qmi_ctx->q6_ul_filter_rule[i].ip == IPA_IP_v4) {
 			req->filter_index_list[i].filter_index = num_v4_rule;
@@ -681,7 +672,6 @@ static int wwan_add_ul_flt_rule_to_ipa(void)
 		req->filter_index_list[i].filter_handle =
 			ipa_qmi_ctx->q6_ul_filter_rule[i].filter_hdl;
 	}
-	mutex_unlock(&ipa_qmi_lock);
 	if (qmi_filter_notify_send(req)) {
 		IPAWANDBG("add filter rule index on A7-RX failed\n");
 		retval = -EFAULT;
@@ -882,8 +872,7 @@ int wwan_update_mux_channel_prop(void)
 	int ret = 0, i;
 	/* install UL filter rules */
 	if (egress_set) {
-		if (ipa_qmi_ctx &&
-			ipa_qmi_ctx->modem_cfg_emb_pipe_flt == false) {
+		if (ipa_qmi_ctx->modem_cfg_emb_pipe_flt == false) {
 			IPAWANDBG("setup UL filter rules\n");
 			if (a7_ul_flt_set) {
 				IPAWANDBG("del previous UL filter rules\n");
@@ -1377,11 +1366,9 @@ static int ipa_wwan_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 					rmnet_mux_val.mux_id);
 				return rc;
 			}
-			mutex_lock(&add_mux_channel_lock);
 			if (rmnet_index >= MAX_NUM_OF_MUX_CHANNEL) {
 				IPAWANERR("Exceed mux_channel limit(%d)\n",
 				rmnet_index);
-				mutex_unlock(&add_mux_channel_lock);
 				return -EFAULT;
 			}
 			IPAWANDBG("ADD_MUX_CHANNEL(%d, name: %s)\n",
@@ -1393,9 +1380,6 @@ static int ipa_wwan_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 			memcpy(mux_channel[rmnet_index].vchannel_name,
 				extend_ioctl_data.u.rmnet_mux_val.vchannel_name,
 				sizeof(mux_channel[rmnet_index].vchannel_name));
-			mux_channel[rmnet_index].vchannel_name[
-				IFNAMSIZ - 1] = '\0';
-
 			IPAWANDBG("cashe device[%s:%d] in IPA_wan[%d]\n",
 				mux_channel[rmnet_index].vchannel_name,
 				mux_channel[rmnet_index].mux_id,
@@ -1410,7 +1394,6 @@ static int ipa_wwan_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 					IPAWANERR("device %s reg IPA failed\n",
 						extend_ioctl_data.u.
 						rmnet_mux_val.vchannel_name);
-					mutex_unlock(&add_mux_channel_lock);
 					return -ENODEV;
 				}
 				mux_channel[rmnet_index].mux_channel_set = true;
@@ -1423,7 +1406,6 @@ static int ipa_wwan_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 				mux_channel[rmnet_index].ul_flt_reg = false;
 			}
 			rmnet_index++;
-			mutex_unlock(&add_mux_channel_lock);
 			break;
 		case RMNET_IOCTL_SET_EGRESS_DATA_FORMAT:
 			IPAWANDBG("get RMNET_IOCTL_SET_EGRESS_DATA_FORMAT\n");
@@ -1468,14 +1450,10 @@ static int ipa_wwan_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 
 			if (num_q6_rule != 0) {
 				/* already got Q6 UL filter rules*/
-				if (ipa_qmi_ctx &&
-					ipa_qmi_ctx->modem_cfg_emb_pipe_flt
-					== false) {
-					/* protect num_q6_rule */
-					mutex_lock(&add_mux_channel_lock);
+				if (ipa_qmi_ctx->modem_cfg_emb_pipe_flt
+					== false)
 					rc = wwan_add_ul_flt_rule_to_ipa();
-					mutex_unlock(&add_mux_channel_lock);
-				} else
+				else
 					rc = 0;
 				egress_set = true;
 				if (rc)
@@ -1567,7 +1545,6 @@ static int ipa_wwan_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 				IPAWANERR("Failed to allocate memory.\n");
 				return -ENOMEM;
 			}
-			extend_ioctl_data.u.if_name[IFNAMSIZ-1] = '\0';
 			len = sizeof(wan_msg->upstream_ifname) >
 			sizeof(extend_ioctl_data.u.if_name) ?
 				sizeof(extend_ioctl_data.u.if_name) :
@@ -2445,9 +2422,6 @@ int rmnet_ipa_set_data_quota(struct wan_ioctl_set_data_quota *data)
 	int index;
 	struct ipa_set_data_usage_quota_req_msg_v01 req;
 
-	/* prevent string buffer overflows */
-	data->interface_name[IFNAMSIZ-1] = '\0';
-
 	index = find_vchannel_name_index(data->interface_name);
 	IPAWANERR("iface name %s, quota %lu\n",
 			  data->interface_name,
@@ -2542,12 +2516,6 @@ int rmnet_ipa_query_tethering_stats(struct wan_ioctl_query_tether_stats *data,
 	struct ipa_get_data_stats_req_msg_v01 *req;
 	struct ipa_get_data_stats_resp_msg_v01 *resp;
 	int pipe_len, rc;
-
-	if (data != NULL) {
-		/* prevent string buffer overflows */
-		data->upstreamIface[IFNAMSIZ-1] = '\0';
-		data->tetherIface[IFNAMSIZ-1] = '\0';
-	}
 
 	req = kzalloc(sizeof(struct ipa_get_data_stats_req_msg_v01),
 			GFP_KERNEL);
@@ -2779,11 +2747,7 @@ static int __init ipa_wwan_init(void)
 	atomic_set(&is_ssr, 0);
 
 	mutex_init(&ipa_to_apps_pipe_handle_guard);
-	mutex_init(&add_mux_channel_lock);
 	ipa_to_apps_hdl = -1;
-
-	ipa_qmi_init();
-
 	/* Register for Modem SSR */
 	subsys_notify_handle = subsys_notif_register_notifier(SUBSYS_MODEM,
 						&ssr_notifier);
@@ -2796,9 +2760,7 @@ static int __init ipa_wwan_init(void)
 static void __exit ipa_wwan_cleanup(void)
 {
 	int ret;
-	ipa_qmi_cleanup();
 	mutex_destroy(&ipa_to_apps_pipe_handle_guard);
-	mutex_destroy(&add_mux_channel_lock);
 	ret = subsys_notif_unregister_notifier(subsys_notify_handle,
 					&ssr_notifier);
 	if (ret)

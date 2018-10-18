@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -921,11 +921,6 @@ enum ipacm_client_enum ipa3_get_client(int pipe_idx)
  */
 bool ipa3_get_client_uplink(int pipe_idx)
 {
-	if (pipe_idx < 0 || pipe_idx >= IPA3_MAX_NUM_PIPES) {
-		IPAERR("invalid pipe idx %d\n", pipe_idx);
-		return false;
-	}
-
 	return ipa3_ctx->ipacm_client[pipe_idx].uplink;
 }
 
@@ -4138,7 +4133,7 @@ static int ipa3_tag_generate_force_close_desc(struct ipa3_desc desc[],
 			IPAHAL_FULL_PIPELINE_CLEAR;
 		reg_write_agg_close.offset =
 			ipahal_get_reg_ofst(IPA_AGGR_FORCE_CLOSE);
-		ipahal_get_aggr_force_close_valmask(i, &valmask);
+		ipahal_get_aggr_force_close_valmask(1<<i, &valmask);
 		reg_write_agg_close.value = valmask.val;
 		reg_write_agg_close.value_mask = valmask.mask;
 		cmd_pyld = ipahal_construct_imm_cmd(IPA_IMM_CMD_REGISTER_WRITE,
@@ -5091,69 +5086,15 @@ int ipa3_generate_eq_from_hw_rule(
 	return 0;
 }
 
-static int ipa3_load_single_fw(const struct firmware *firmware,
-	const struct elf32_phdr *phdr)
-{
-	uint32_t *fw_mem_base;
-	int index;
-	const uint32_t *elf_data_ptr;
-
-	if (phdr->p_offset > firmware->size) {
-		IPAERR("Invalid ELF: offset=%u is beyond elf_size=%zu\n",
-			phdr->p_offset, firmware->size);
-		return -EINVAL;
-	}
-	if ((firmware->size - phdr->p_offset) < phdr->p_filesz) {
-		IPAERR("Invalid ELF: offset=%u filesz=%u elf_size=%zu\n",
-			phdr->p_offset, phdr->p_filesz, firmware->size);
-		return -EINVAL;
-	}
-
-	if (phdr->p_memsz % sizeof(uint32_t)) {
-		IPAERR("FW mem size %u doesn't align to 32bit\n",
-			phdr->p_memsz);
-		return -EFAULT;
-	}
-
-	if (phdr->p_filesz > phdr->p_memsz) {
-		IPAERR("FW image too big src_size=%u dst_size=%u\n",
-			phdr->p_filesz, phdr->p_memsz);
-		return -EFAULT;
-	}
-
-	fw_mem_base = ioremap(phdr->p_paddr, phdr->p_memsz);
-	if (!fw_mem_base) {
-		IPAERR("Failed to map 0x%x for the size of %u\n",
-			phdr->p_paddr, phdr->p_memsz);
-		return -ENOMEM;
-	}
-
-	/* Set the entire region to 0s */
-	memset(fw_mem_base, 0, phdr->p_memsz);
-
-	elf_data_ptr = (uint32_t *)(firmware->data + phdr->p_offset);
-
-	/* Write the FW */
-	for (index = 0; index < phdr->p_filesz/sizeof(uint32_t); index++) {
-		writel_relaxed(*elf_data_ptr, &fw_mem_base[index]);
-		elf_data_ptr++;
-	}
-
-	iounmap(fw_mem_base);
-
-	return 0;
-}
-
 /**
  * ipa3_load_fws() - Load the IPAv3 FWs into IPA&GSI SRAM.
  *
  * @firmware: Structure which contains the FW data from the user space.
- * @gsi_mem_base: GSI base address
  *
  * Return value: 0 on success, negative otherwise
  *
  */
-int ipa3_load_fws(const struct firmware *firmware, phys_addr_t gsi_mem_base)
+int ipa3_load_fws(const struct firmware *firmware)
 {
 	/*
 	 * TODO: Do we need to use a generic elf_hdr/elf_phdr
@@ -5161,97 +5102,62 @@ int ipa3_load_fws(const struct firmware *firmware, phys_addr_t gsi_mem_base)
 	 */
 	const struct elf32_hdr *ehdr;
 	const struct elf32_phdr *phdr;
-	unsigned long gsi_iram_ofst;
-	unsigned long gsi_iram_size;
-	phys_addr_t ipa_reg_mem_base;
-	u32 ipa_reg_ofst;
-	int rc;
-
-	if (!gsi_mem_base) {
-		IPAERR("Invalid GSI base address\n");
-		return -EINVAL;
-	}
-
-	ipa_assert_on(!firmware);
-	/* One program header per FW image: GSI, DPS and HPS */
-	if (firmware->size < (sizeof(*ehdr) + 3 * sizeof(*phdr))) {
-		IPAERR("Missing ELF and Program headers firmware size=%zu\n",
-			firmware->size);
-		return -EINVAL;
-	}
+	const uint8_t *elf_phdr_ptr;
+	uint32_t *elf_data_ptr;
+	int phdr_idx, index;
+	uint32_t *fw_mem_base;
 
 	ehdr = (struct elf32_hdr *) firmware->data;
-	ipa_assert_on(!ehdr);
-	if (ehdr->e_phnum != 3) {
-		IPAERR("Unexpected number of ELF program headers\n");
-		return -EINVAL;
-	}
-	phdr = (struct elf32_phdr *)(firmware->data + sizeof(*ehdr));
 
-	/*
-	 * Each ELF program header represents a FW image and contains:
-	 *  p_paddr : The starting address to which the FW needs to loaded.
-	 *  p_memsz : The size of the IRAM (where the image loaded)
-	 *  p_filesz: The size of the FW image embedded inside the ELF
-	 *  p_offset: Absolute offset to the image from the head of the ELF
-	 */
+	elf_phdr_ptr = firmware->data + sizeof(*ehdr);
 
-	/* Load GSI FW image */
-	gsi_get_inst_ram_offset_and_size(&gsi_iram_ofst, &gsi_iram_size);
-	if (phdr->p_paddr != (gsi_mem_base + gsi_iram_ofst)) {
-		IPAERR(
-			"Invalid GSI FW img load addr paddr=0x%x gsi_mem_base=%pa gsi_iram_ofst=0x%lx\n"
-			, phdr->p_paddr, &gsi_mem_base, gsi_iram_ofst);
-		return -EINVAL;
-	}
-	if (phdr->p_memsz > gsi_iram_size) {
-		IPAERR("Invalid GSI FW img size memsz=%d gsi_iram_size=%lu\n",
-			phdr->p_memsz, gsi_iram_size);
-		return -EINVAL;
-	}
-	rc = ipa3_load_single_fw(firmware, phdr);
-	if (rc)
-		return rc;
+	for (phdr_idx = 0; phdr_idx < ehdr->e_phnum; phdr_idx++) {
+		/*
+		 * The ELF program header will contain the starting
+		 * address to which the firmware needs to copied.
+		 */
+		phdr = (struct elf32_phdr *)elf_phdr_ptr;
 
-	phdr++;
-	ipa_reg_mem_base = ipa3_ctx->ipa_wrapper_base + ipahal_get_reg_base();
+		/*
+		 * p_addr will contain the physical address to which the
+		 * FW needs to be loaded.
+		 * p_memsz will contain the size of the IRAM.
+		 * p_filesz will contain the size of the FW image.
+		 */
+		fw_mem_base = ioremap(phdr->p_paddr, phdr->p_memsz);
+		if (!fw_mem_base) {
+			IPAERR("Failed to map 0x%x for the size of %u\n",
+				phdr->p_paddr, phdr->p_memsz);
+				return -ENOMEM;
+		}
 
-	/* Load IPA DPS FW image */
-	ipa_reg_ofst = ipahal_get_reg_ofst(IPA_DPS_SEQUENCER_FIRST);
-	if (phdr->p_paddr != (ipa_reg_mem_base + ipa_reg_ofst)) {
-		IPAERR(
-			"Invalid IPA DPS img load addr paddr=0x%x ipa_reg_mem_base=%pa ipa_reg_ofst=%u\n"
-			, phdr->p_paddr, &ipa_reg_mem_base, ipa_reg_ofst);
-		return -EINVAL;
-	}
-	if (phdr->p_memsz > ipahal_get_dps_img_mem_size()) {
-		IPAERR("Invalid IPA DPS img size memsz=%d dps_mem_size=%u\n",
-			phdr->p_memsz, ipahal_get_dps_img_mem_size());
-		return -EINVAL;
-	}
-	rc = ipa3_load_single_fw(firmware, phdr);
-	if (rc)
-		return rc;
+		/* Set the entire region to 0s */
+		memset(fw_mem_base, 0, phdr->p_memsz);
 
-	phdr++;
+		/*
+		 * p_offset will contain and absolute offset from the beginning
+		 * of the ELF file.
+		 */
+		elf_data_ptr = (uint32_t *)
+				((uint8_t *)firmware->data + phdr->p_offset);
 
-	/* Load IPA HPS FW image */
-	ipa_reg_ofst = ipahal_get_reg_ofst(IPA_HPS_SEQUENCER_FIRST);
-	if (phdr->p_paddr != (ipa_reg_mem_base + ipa_reg_ofst)) {
-		IPAERR(
-			"Invalid IPA HPS img load addr paddr=0x%x ipa_reg_mem_base=%pa ipa_reg_ofst=%u\n"
-			, phdr->p_paddr, &ipa_reg_mem_base, ipa_reg_ofst);
-		return -EINVAL;
-	}
-	if (phdr->p_memsz > ipahal_get_hps_img_mem_size()) {
-		IPAERR("Invalid IPA HPS img size memsz=%d dps_mem_size=%u\n",
-			phdr->p_memsz, ipahal_get_hps_img_mem_size());
-		return -EINVAL;
-	}
-	rc = ipa3_load_single_fw(firmware, phdr);
-	if (rc)
-		return rc;
+		if (phdr->p_memsz % sizeof(uint32_t)) {
+			IPAERR("FW size %u doesn't align to 32bit\n",
+				phdr->p_memsz);
+			return -EFAULT;
+		}
 
-	IPADBG("IPA FWs (GSI FW, DPS and HPS) loaded successfully\n");
+		/* Write the FW */
+		for (index = 0; index < phdr->p_filesz/sizeof(uint32_t);
+			index++) {
+			writel_relaxed(*elf_data_ptr, &fw_mem_base[index]);
+			elf_data_ptr++;
+		}
+
+		iounmap(fw_mem_base);
+
+		elf_phdr_ptr = elf_phdr_ptr + sizeof(*phdr);
+	}
+	IPADBG("IPA FWs (GSI FW, HPS and DPS) were loaded\n");
 	return 0;
 }

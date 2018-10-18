@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2015-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -25,7 +25,6 @@
 #include <sound/pcm.h>
 #include <sound/jack.h>
 #include <sound/q6afe-v2.h>
-#include <sound/q6core.h>
 #include <soc/qcom/socinfo.h>
 #include "qdsp6v2/msm-pcm-routing-v2.h"
 #include "msm-audio-pinctrl.h"
@@ -57,6 +56,8 @@ enum btsco_rates {
 	RATE_8KHZ_ID,
 	RATE_16KHZ_ID,
 };
+
+int ext_spk_pa_gpio = -1;
 
 static int msm8952_auxpcm_rate = 8000;
 static int msm_btsco_rate = BTSCO_RATE_8KHZ;
@@ -529,6 +530,8 @@ static int msm_mi2s_sclk_ctl(struct snd_pcm_substream *substream, bool enable)
 {
 	int ret = 0;
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+	struct snd_soc_card *card = rtd->card;
+	struct msm8916_asoc_mach_data *pdata = snd_soc_card_get_drvdata(card);
 	int port_id = 0;
 
 	port_id = msm8952_get_port_id(rtd->dai_link->be_id);
@@ -538,15 +541,12 @@ static int msm_mi2s_sclk_ctl(struct snd_pcm_substream *substream, bool enable)
 	}
 	if (enable) {
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-			switch (q6core_get_avs_version()) {
-			case (Q6_SUBSYS_AVS2_6):
+			if (pdata->afe_clk_ver == AFE_CLK_VERSION_V1) {
 				mi2s_rx_clk_v1.clk_val1 =
 						get_mi2s_rx_clk_val(port_id);
 				ret = afe_set_lpass_clock(port_id,
 							&mi2s_rx_clk_v1);
-				break;
-			case (Q6_SUBSYS_AVS2_7):
-			case (Q6_SUBSYS_AVS2_8):
+			} else {
 				mi2s_rx_clk.enable = enable;
 				mi2s_rx_clk.clk_id =
 						msm8952_get_clk_id(port_id);
@@ -554,23 +554,14 @@ static int msm_mi2s_sclk_ctl(struct snd_pcm_substream *substream, bool enable)
 						get_mi2s_rx_clk_val(port_id);
 				ret = afe_set_lpass_clock_v2(port_id,
 							&mi2s_rx_clk);
-				break;
-			case (Q6_SUBSYS_INVALID):
-			default:
-				ret = -EINVAL;
-				pr_err("%s: INVALID AVS IMAGE\n", __func__);
-				break;
 			}
 		} else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
-			switch (q6core_get_avs_version()) {
-			case (Q6_SUBSYS_AVS2_6):
+			if (pdata->afe_clk_ver == AFE_CLK_VERSION_V1) {
 				mi2s_tx_clk_v1.clk_val1 =
 						Q6AFE_LPASS_IBIT_CLK_1_P536_MHZ;
 				ret = afe_set_lpass_clock(port_id,
 							&mi2s_tx_clk_v1);
-				break;
-			case (Q6_SUBSYS_AVS2_7):
-			case (Q6_SUBSYS_AVS2_8):
+			} else {
 				mi2s_tx_clk.enable = enable;
 				mi2s_tx_clk.clk_id =
 						msm8952_get_clk_id(port_id);
@@ -578,12 +569,6 @@ static int msm_mi2s_sclk_ctl(struct snd_pcm_substream *substream, bool enable)
 						Q6AFE_LPASS_IBIT_CLK_1_P536_MHZ;
 				ret = afe_set_lpass_clock_v2(port_id,
 							&mi2s_tx_clk);
-				break;
-			case (Q6_SUBSYS_INVALID):
-			default:
-				ret = -EINVAL;
-				pr_err("%s: INVALID AVS IMAGE\n", __func__);
-				break;
 			}
 		} else {
 			pr_err("%s:Not valid substream.\n", __func__);
@@ -593,48 +578,30 @@ static int msm_mi2s_sclk_ctl(struct snd_pcm_substream *substream, bool enable)
 			pr_err("%s:afe_set_lpass_clock_v2 failed\n", __func__);
 	} else {
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-			switch (q6core_get_avs_version()) {
-			case (Q6_SUBSYS_AVS2_6):
+			if (pdata->afe_clk_ver == AFE_CLK_VERSION_V1) {
 				mi2s_rx_clk_v1.clk_val1 =
 						Q6AFE_LPASS_IBIT_CLK_DISABLE;
 				ret = afe_set_lpass_clock(port_id,
 							&mi2s_rx_clk_v1);
-				break;
-			case (Q6_SUBSYS_AVS2_7):
-			case (Q6_SUBSYS_AVS2_8):
+			} else {
 				mi2s_rx_clk.enable = enable;
 				mi2s_rx_clk.clk_id =
 						msm8952_get_clk_id(port_id);
 				ret = afe_set_lpass_clock_v2(port_id,
 							&mi2s_rx_clk);
-				break;
-			case (Q6_SUBSYS_INVALID):
-			default:
-				ret = -EINVAL;
-				pr_err("%s: INVALID AVS IMAGE\n", __func__);
-				break;
 			}
 		} else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
-			switch (q6core_get_avs_version()) {
-			case (Q6_SUBSYS_AVS2_6):
+			if (pdata->afe_clk_ver == AFE_CLK_VERSION_V1) {
 				mi2s_tx_clk_v1.clk_val1 =
 						Q6AFE_LPASS_IBIT_CLK_DISABLE;
 				ret = afe_set_lpass_clock(port_id,
 							&mi2s_tx_clk_v1);
-				break;
-			case (Q6_SUBSYS_AVS2_7):
-			case (Q6_SUBSYS_AVS2_8):
+			} else {
 				mi2s_tx_clk.enable = enable;
 				mi2s_tx_clk.clk_id =
 						msm8952_get_clk_id(port_id);
 				ret = afe_set_lpass_clock_v2(port_id,
 							&mi2s_tx_clk);
-				break;
-			case (Q6_SUBSYS_INVALID):
-			default:
-				ret = -EINVAL;
-				pr_err("%s: INVALID AVS IMAGE\n", __func__);
-				break;
 			}
 		} else {
 			pr_err("%s:Not valid substream.\n", __func__);
@@ -662,26 +629,17 @@ static int msm8952_enable_dig_cdc_clk(struct snd_soc_codec *codec,
 					&pdata->disable_mclk_work);
 			mutex_lock(&pdata->cdc_mclk_mutex);
 			if (atomic_read(&pdata->mclk_enabled) == false) {
-				switch (q6core_get_avs_version()) {
-				case (Q6_SUBSYS_AVS2_6):
+				if (pdata->afe_clk_ver == AFE_CLK_VERSION_V1) {
 					pdata->digital_cdc_clk.clk_val =
 							pdata->mclk_freq;
 					ret = afe_set_digital_codec_core_clock(
 						AFE_PORT_ID_PRIMARY_MI2S_RX,
 						&pdata->digital_cdc_clk);
-					break;
-				case (Q6_SUBSYS_AVS2_7):
-				case (Q6_SUBSYS_AVS2_8):
+				} else {
 					pdata->digital_cdc_core_clk.enable = 1;
 					ret = afe_set_lpass_clock_v2(
 						AFE_PORT_ID_PRIMARY_MI2S_RX,
 						&pdata->digital_cdc_core_clk);
-					break;
-				case (Q6_SUBSYS_INVALID):
-				default:
-					ret = -EINVAL;
-					pr_err("%s: INVALID AVS IMAGE\n", __func__);
-					break;
 				}
 				if (ret < 0) {
 					pr_err("%s: failed to enable CCLK\n",
@@ -699,25 +657,16 @@ static int msm8952_enable_dig_cdc_clk(struct snd_soc_codec *codec,
 		cancel_delayed_work_sync(&pdata->disable_mclk_work);
 		mutex_lock(&pdata->cdc_mclk_mutex);
 		if (atomic_read(&pdata->mclk_enabled) == true) {
-			switch (q6core_get_avs_version()) {
-			case (Q6_SUBSYS_AVS2_6):
+			if (pdata->afe_clk_ver == AFE_CLK_VERSION_V1) {
 				pdata->digital_cdc_clk.clk_val = 0;
 				ret = afe_set_digital_codec_core_clock(
 					AFE_PORT_ID_PRIMARY_MI2S_RX,
 					&pdata->digital_cdc_clk);
-				break;
-			case (Q6_SUBSYS_AVS2_7):
-			case (Q6_SUBSYS_AVS2_8):
+			} else {
 				pdata->digital_cdc_core_clk.enable = 0;
 				ret = afe_set_lpass_clock_v2(
 					AFE_PORT_ID_PRIMARY_MI2S_RX,
 					&pdata->digital_cdc_core_clk);
-				break;
-			case (Q6_SUBSYS_INVALID):
-			default:
-				ret = -EINVAL;
-				pr_err("%s: INVALID AVS IMAGE\n", __func__);
-				break;
 			}
 			if (ret < 0)
 				pr_err("%s: failed to disable CCLK\n",
@@ -824,26 +773,17 @@ static int loopback_mclk_put(struct snd_kcontrol *kcontrol,
 		mutex_lock(&pdata->cdc_mclk_mutex);
 		if ((!atomic_read(&pdata->mclk_rsc_ref)) &&
 				(!atomic_read(&pdata->mclk_enabled))) {
-			switch (q6core_get_avs_version()) {
-			case (Q6_SUBSYS_AVS2_6):
+			if (pdata->afe_clk_ver == AFE_CLK_VERSION_V1) {
 				pdata->digital_cdc_clk.clk_val =
 						pdata->mclk_freq;
 				ret = afe_set_digital_codec_core_clock(
 					AFE_PORT_ID_PRIMARY_MI2S_RX,
 					&pdata->digital_cdc_clk);
-				break;
-			case (Q6_SUBSYS_AVS2_7):
-			case (Q6_SUBSYS_AVS2_8):
+			} else {
 				pdata->digital_cdc_core_clk.enable = 1;
 				ret = afe_set_lpass_clock_v2(
 					AFE_PORT_ID_PRIMARY_MI2S_RX,
 					&pdata->digital_cdc_core_clk);
-				break;
-			case (Q6_SUBSYS_INVALID):
-			default:
-				ret = -EINVAL;
-				pr_err("%s: INVALID AVS IMAGE\n", __func__);
-				break;
 			}
 			if (ret < 0) {
 				pr_err("%s: failed to enable the MCLK: %d\n",
@@ -869,25 +809,16 @@ static int loopback_mclk_put(struct snd_kcontrol *kcontrol,
 		mutex_lock(&pdata->cdc_mclk_mutex);
 		if ((!atomic_dec_return(&pdata->mclk_rsc_ref)) &&
 				(atomic_read(&pdata->mclk_enabled))) {
-			switch (q6core_get_avs_version()) {
-			case (Q6_SUBSYS_AVS2_6):
+			if (pdata->afe_clk_ver == AFE_CLK_VERSION_V1) {
 				pdata->digital_cdc_clk.clk_val = 0;
 				ret = afe_set_digital_codec_core_clock(
 					AFE_PORT_ID_PRIMARY_MI2S_RX,
 					&pdata->digital_cdc_clk);
-				break;
-			case (Q6_SUBSYS_AVS2_7):
-			case (Q6_SUBSYS_AVS2_8):
+			} else {
 				pdata->digital_cdc_core_clk.enable = 0;
 				ret = afe_set_lpass_clock_v2(
 					AFE_PORT_ID_PRIMARY_MI2S_RX,
 					&pdata->digital_cdc_core_clk);
-				break;
-			case (Q6_SUBSYS_INVALID):
-			default:
-				ret = -EINVAL;
-				pr_err("%s: INVALID AVS IMAGE\n", __func__);
-				break;
 			}
 			if (ret < 0) {
 				pr_err("%s: failed to disable the CCLK: %d\n",
@@ -1131,26 +1062,17 @@ static int msm8952_enable_wsa_mclk(struct snd_soc_card *card, bool enable)
 	mutex_lock(&pdata->wsa_mclk_mutex);
 	if (enable) {
 		if (!atomic_read(&pdata->wsa_mclk_rsc_ref)) {
-			switch (q6core_get_avs_version()) {
-			case (Q6_SUBSYS_AVS2_6):
+			if (pdata->afe_clk_ver == AFE_CLK_VERSION_V1) {
 				wsa_ana_clk_v1.clk_val1 =
 						Q6AFE_LPASS_OSR_CLK_9_P600_MHZ;
 				ret = afe_set_lpass_clock(
 						AFE_PORT_ID_PRIMARY_MI2S_RX,
 						&wsa_ana_clk_v1);
-				break;
-			case (Q6_SUBSYS_AVS2_7):
-			case (Q6_SUBSYS_AVS2_8):
+			} else {
 				wsa_ana_clk.enable = enable;
 				ret = afe_set_lpass_clock_v2(
 						AFE_PORT_ID_PRIMARY_MI2S_RX,
 						&wsa_ana_clk);
-				break;
-			case (Q6_SUBSYS_INVALID):
-			default:
-				ret = -EINVAL;
-				pr_err("%s: INVALID AVS IMAGE\n", __func__);
-				break;
 			}
 			if (ret < 0) {
 				pr_err("%s: failed to enable mclk %d\n",
@@ -1163,26 +1085,17 @@ static int msm8952_enable_wsa_mclk(struct snd_soc_card *card, bool enable)
 		if (!atomic_read(&pdata->wsa_mclk_rsc_ref))
 			goto done;
 		if (!atomic_dec_return(&pdata->wsa_mclk_rsc_ref)) {
-			switch (q6core_get_avs_version()) {
-			case (Q6_SUBSYS_AVS2_6):
+			if (pdata->afe_clk_ver == AFE_CLK_VERSION_V1) {
 				wsa_ana_clk_v1.clk_val1 =
 						Q6AFE_LPASS_OSR_CLK_DISABLE;
 				ret = afe_set_lpass_clock(
 						AFE_PORT_ID_PRIMARY_MI2S_RX,
 						&wsa_ana_clk_v1);
-				break;
-			case (Q6_SUBSYS_AVS2_7):
-			case (Q6_SUBSYS_AVS2_8):
+			} else {
 				wsa_ana_clk.enable = enable;
 				ret = afe_set_lpass_clock_v2(
 						AFE_PORT_ID_PRIMARY_MI2S_RX,
 						&wsa_ana_clk);
-				break;
-			case (Q6_SUBSYS_INVALID):
-			default:
-				ret = -EINVAL;
-				pr_err("%s: INVALID AVS IMAGE\n", __func__);
-				break;
 			}
 			if (ret < 0) {
 				pr_err("%s: failed to disable mclk %d\n",
@@ -2671,25 +2584,17 @@ void msm8952_disable_mclk(struct work_struct *work)
 	if (atomic_read(&pdata->mclk_enabled) == true
 			&& atomic_read(&pdata->mclk_rsc_ref) == 0) {
 		pr_debug("Disable the mclk\n");
-		switch (q6core_get_avs_version()) {
-		case (Q6_SUBSYS_AVS2_6):
+		if (pdata->afe_clk_ver == AFE_CLK_VERSION_V1) {
 			pdata->digital_cdc_clk.clk_val = 0;
 			ret = afe_set_digital_codec_core_clock(
 				AFE_PORT_ID_PRIMARY_MI2S_RX,
 				&pdata->digital_cdc_clk);
-			break;
-		case (Q6_SUBSYS_AVS2_7):
-		case (Q6_SUBSYS_AVS2_8):
+
+		} else {
 			pdata->digital_cdc_core_clk.enable = 0;
 			ret = afe_set_lpass_clock_v2(
 				AFE_PORT_ID_PRIMARY_MI2S_RX,
 				&pdata->digital_cdc_core_clk);
-			break;
-		case (Q6_SUBSYS_INVALID):
-		default:
-			ret = -EINVAL;
-			pr_err("%s: INVALID AVS IMAGE\n", __func__);
-			break;
 		}
 		if (ret < 0)
 			pr_err("%s failed to disable the CCLK\n", __func__);
@@ -2939,6 +2844,22 @@ static struct snd_soc_card *msm8952_populate_sndcard_dailinks(
 	return card;
 }
 
+static int msm8952_ext_spk_pa_init(struct platform_device *pdev)
+{
+	int ret = 0;
+
+	ext_spk_pa_gpio = of_get_named_gpio(pdev->dev.of_node, "qcom,ext-spk-amp-gpio", 0);
+	if (gpio_is_valid(ext_spk_pa_gpio)) {
+		ret = gpio_request(ext_spk_pa_gpio, "ext_spk_amp_gpio");
+		if (ret) {
+			pr_err("%s: gpio_request failed for ext_spk_amp_gpio.\n", __func__);
+			return -EINVAL;
+		}
+		gpio_direction_output(ext_spk_pa_gpio, 0);
+	}
+	return 0;
+}
+
 static int msm8952_asoc_machine_probe(struct platform_device *pdev)
 {
 	struct snd_soc_card *card;
@@ -2953,7 +2874,7 @@ static int msm8952_asoc_machine_probe(struct platform_device *pdev)
 	const char *wsa_str = NULL;
 	const char *wsa_prefix_str = NULL;
 	int num_strings;
-	int ret, id, i;
+	int ret, id, i, val;
 	struct resource	*muxsel;
 	char *temp_str = NULL;
 
@@ -3147,6 +3068,8 @@ parse_mclk_freq:
 		goto err;
 	}
 
+	/*init spk boost*/
+	msm8952_ext_spk_pa_init(pdev);
 	ret = is_ext_spk_gpio_support(pdev, pdata);
 	if (ret < 0)
 		pr_err("%s:  doesn't support external speaker pa\n",
@@ -3167,6 +3090,12 @@ parse_mclk_freq:
 		mbhc_cfg.hs_ext_micbias = false;
 	}
 
+	ret = of_property_read_u32(pdev->dev.of_node,
+				  "qcom,msm-afe-clk-ver", &val);
+	if (ret)
+		pdata->afe_clk_ver = AFE_CLK_VERSION_V2;
+	else
+		pdata->afe_clk_ver = val;
 	/* initialize the mclk */
 	pdata->digital_cdc_clk.i2s_cfg_minor_version =
 					AFE_API_VERSION_I2S_CONFIG;
@@ -3227,14 +3156,6 @@ parse_mclk_freq:
 			ret);
 		goto err;
 	}
-
-	ret = core_get_adsp_ver();
-	if (ret < 0) {
-		ret = -EPROBE_DEFER;
-		dev_dbg(&pdev->dev, "%s: Get adsp version failed (%d)\n",
-						__func__, ret);
-		goto err;
-	}
 	return 0;
 err:
 	if (pdata->vaddr_gpio_mux_spkr_ctl)
@@ -3263,6 +3184,9 @@ static int msm8952_asoc_machine_remove(struct platform_device *pdev)
 	struct msm8916_asoc_mach_data *pdata = snd_soc_card_get_drvdata(card);
 	int i;
 
+
+	if (gpio_is_valid(ext_spk_pa_gpio))
+		gpio_free(ext_spk_pa_gpio);
 	if (pdata->vaddr_gpio_mux_spkr_ctl)
 		iounmap(pdata->vaddr_gpio_mux_spkr_ctl);
 	if (pdata->vaddr_gpio_mux_mic_ctl)

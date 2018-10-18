@@ -23,6 +23,13 @@
 #include <linux/debugfs.h>
 #include <linux/pm_wakeup.h>
 #include <linux/spinlock.h>
+#include <linux/wakelock.h>
+#include <linux/qpnp/qpnp-adc.h>
+#include <soc/qcom/socinfo.h>
+#include <linux/alarmtimer.h>
+
+static bool is_fake_battery = false;
+module_param(is_fake_battery, bool, 0644);
 
 struct smb23x_wakeup_source {
 	struct wakeup_source source;
@@ -63,10 +70,24 @@ struct smb23x_chip {
 	int				cfg_safety_time;
 
 	int				*cfg_thermal_mitigation;
+	int				hot_batt_p;
+	int				cold_batt_p;
+	int				low_temp_threshold;
+	int				high_temp_threshold;
+	int				cfg_warm_comp_mv;
+	int				cfg_cool_comp_mv;
+	int				cfg_warm_comp_ma;
+	int				cfg_cool_comp_ma;
+	int				tm_state;
+	int				board_ver_id;
+	struct wake_lock	charger_wake_lock;
+	struct wake_lock	charger_valid_lock;
 
 	/* status */
 	bool				batt_present;
 	bool				batt_full;
+	bool				batt_warm_full;
+	bool				batt_real_full;
 	bool				batt_hot;
 	bool				batt_cold;
 	bool				batt_warm;
@@ -96,9 +117,13 @@ struct smb23x_chip {
 	struct mutex			chg_disable_lock;
 	struct mutex			usb_suspend_lock;
 	struct mutex			icl_set_lock;
+	struct mutex			jeita_configure_lock;
 	struct dentry			*debug_root;
 	struct delayed_work		irq_polling_work;
 	struct smb23x_wakeup_source	smb23x_ws;
+	struct delayed_work		temp_control_work;
+	struct qpnp_vadc_chip	*vadc_dev;
+	struct alarm			update_temp_alarm;
 };
 
 static int usbin_current_ma_table[] = {
@@ -185,7 +210,7 @@ static int hot_bat_decidegc_table[] = {
 
 
 #define MIN_FLOAT_MV	3480
-#define MAX_FLOAT_MV	4720
+#define MAX_FLOAT_MV	4400
 #define FLOAT_STEP_MV	40
 
 #define _SMB_MASK(BITS, POS) \
@@ -217,6 +242,7 @@ static int hot_bat_decidegc_table[] = {
 #define SAFETY_TIMER_MASK	SMB_MASK(4, 3)
 #define SAFETY_TIMER_OFFSET	3
 #define SAFETY_TIMER_DISABLE	SMB_MASK(4, 3)
+#define SYSTEM_VOLTAGE_MASK	SMB_MASK(1, 0)
 
 #define CFG_REG_5		0x05
 #define BAT_THERM_DIS_BIT	BIT(7)
@@ -231,6 +257,9 @@ static int hot_bat_decidegc_table[] = {
 #define CFG_REG_6		0x06
 #define CHG_INHIBIT_THRESH_MASK	SMB_MASK(7, 6)
 #define INHIBIT_THRESH_OFFSET	6
+#define CHG_SYSTEM_VOLTAGE_THRESHOLD_MASK	SMB_MASK(5, 4)
+#define CHG_SYSTEM_VOLTAGE_THRESHOLD__OFFSET 4
+
 #define BMD_ALGO_MASK		SMB_MASK(1, 0)
 #define BMD_ALGO_THERM_IO	SMB_MASK(1, 0)
 
@@ -336,6 +365,10 @@ static int hot_bat_decidegc_table[] = {
 #define USB5_LIMIT		BIT(4)
 #define USB1_LIMIT		BIT(5)
 
+#define BMS_NORMAL_UPDATE_TEMP_INTERVAL_NS	20000000000 /*20s*/
+#define BMS_FAST_UPDATE_TEMP_INTERVAL_NS	1000000000 /*1s*/
+#define BMS_SLOW_UPDATE_TEMP_INTERVAL_NS	300000000000 /*300s*/
+
 struct smb_irq_info {
 	const char	*name;
 	int		(*smb_irq)(struct smb23x_chip *chip, u8 rt_stat);
@@ -360,6 +393,20 @@ enum {
 enum {
 	WRKRND_IRQ_POLLING = BIT(0),
 	WRKRND_USB_SUSPEND = BIT(1),
+};
+
+enum {
+	SMB_TM_HIGHER_STATE,
+	SMB_TM_LOWER_STATE,
+	SMB_TM_NORMAL_STATE,
+};
+
+enum {
+	SMB_TEMP_COLD_STATE,
+	SMB_TEMP_COOL_STATE,
+	SMB_TEMP_NORMAL_STATE,
+	SMB_TEMP_WARM_STATE,
+	SMB_TEMP_HOT_STATE,
 };
 
 static irqreturn_t smb23x_stat_handler(int irq, void *dev_id);
@@ -528,7 +575,8 @@ static int smb23x_parse_dt(struct smb23x_chip *chip)
 	 * BMS power supply instead of the SMB chip itself, so we
 	 * need to keep iterm and recharge on the chip disabled.
 	 */
-	if (chip->cfg_bms_controlled_charging) {
+	if ((chip->cfg_bms_controlled_charging) || (chip->board_ver_id == 0)) {
+		pr_info("board_id:%d\n", chip->board_ver_id);
 		chip->cfg_iterm_disabled = true;
 		chip->cfg_recharge_disabled = true;
 	}
@@ -583,6 +631,36 @@ static int smb23x_parse_dt(struct smb23x_chip *chip)
 					&chip->cfg_hot_bat_decidegc);
 	if (rc < 0)
 		chip->cfg_hot_bat_decidegc = -EINVAL;
+
+	rc = of_property_read_u32(node,"zte,batt-hot-percentage",
+		&chip->hot_batt_p);
+	if (rc < 0)
+			chip->hot_batt_p = -EINVAL;
+
+	rc = of_property_read_u32(node,"zte,batt-cold-percentage",
+		&chip->cold_batt_p);
+	if (rc < 0)
+			chip->cold_batt_p = -EINVAL;
+
+	rc = of_property_read_u32(node,"zte,soft-warm-current-comp-ma",
+		&chip->cfg_warm_comp_ma);
+	if (rc < 0)
+			chip->cfg_warm_comp_ma = -EINVAL;
+
+	rc = of_property_read_u32(node,"zte,soft-cool-current-comp-ma",
+		&chip->cfg_cool_comp_ma);
+	if (rc < 0)
+			chip->cfg_cool_comp_ma = -EINVAL;
+
+	rc = of_property_read_u32(node,"zte,soft-warm-vfloat-comp-mv",
+		&chip->cfg_warm_comp_mv);
+	if (rc < 0)
+			chip->cfg_warm_comp_mv = -EINVAL;
+
+	rc = of_property_read_u32(node,"zte,soft-cool-vfloat-comp-mv",
+		&chip->cfg_cool_comp_mv);
+	if (rc < 0)
+			chip->cfg_cool_comp_mv = -EINVAL;
 
 	rc = of_property_read_u32(node, "qcom,soft-temp-vfloat-comp-mv",
 					&chip->cfg_temp_comp_mv);
@@ -819,10 +897,411 @@ static int smb23x_set_appropriate_usb_current(struct smb23x_chip *chip)
 	return rc;
 }
 
+extern void set_batt_hot_cold_threshold(unsigned int vbatt_hot_threshold,
+	unsigned int vbatt_cold_threshold);
+
+#define DEFAULT_BATT_VOLTAGE	4000
+static int smb23x_get_prop_batt_voltage(struct smb23x_chip *chip)
+{
+	union power_supply_propval ret = {0, };
+
+	if (chip->bms_psy) {
+		chip->bms_psy->get_property(chip->bms_psy,
+				POWER_SUPPLY_PROP_VOLTAGE_NOW, &ret);
+		return ret.intval/1000;
+	}
+
+	return DEFAULT_BATT_VOLTAGE;
+}
+
+static int smb23x_get_prop_batt_voltage_avg(struct smb23x_chip *chip)
+{
+	union power_supply_propval ret = {0, };
+
+	if (chip->bms_psy) {
+		chip->bms_psy->get_property(chip->bms_psy,
+				POWER_SUPPLY_PROP_VOLTAGE_AVG, &ret);
+		return ret.intval/1000;
+	}
+
+	return DEFAULT_BATT_VOLTAGE;
+}
+
+#define DEFAULT_BATT_CAPACITY	60
+static int smb23x_get_prop_batt_capacity(struct smb23x_chip *chip)
+{
+	union power_supply_propval ret = {0, };
+
+	if (is_fake_battery)
+		return DEFAULT_BATT_CAPACITY;
+
+	if (chip->fake_battery_soc != -EINVAL)
+		return chip->fake_battery_soc;
+
+	if (chip->batt_full == true)
+		return 100;
+
+	if (chip->bms_psy) {
+		chip->bms_psy->get_property(chip->bms_psy,
+				POWER_SUPPLY_PROP_CAPACITY, &ret);
+		return ret.intval;
+	}
+
+	return DEFAULT_BATT_CAPACITY;
+}
+
+static int smb23x_get_prop_batt_real_capacity(struct smb23x_chip *chip)
+{
+	union power_supply_propval ret = {0, };
+
+	if (is_fake_battery)
+		return DEFAULT_BATT_CAPACITY;
+
+	if (chip->fake_battery_soc != -EINVAL)
+		return chip->fake_battery_soc;
+
+	if (chip->bms_psy) {
+		chip->bms_psy->get_property(chip->bms_psy,
+				POWER_SUPPLY_PROP_CAPACITY, &ret);
+		return ret.intval;
+	}
+
+	return DEFAULT_BATT_CAPACITY;
+}
+
+#define SYSTEM_VOLTAGE_RESET_GATE	4050
+static void smb23x_system_voltage_set(struct smb23x_chip *chip)
+{
+	int rc;
+	u8 tmp;
+
+	rc = smb23x_masked_write(chip, CFG_REG_4,
+		SYSTEM_VOLTAGE_MASK,
+		2);
+	if (rc < 0) {
+		pr_err("Set System Voltage failed, rc=%d\n", rc);
+		return;
+	}
+
+	rc = smb23x_masked_write(chip, CFG_REG_6,
+		CHG_SYSTEM_VOLTAGE_THRESHOLD_MASK,
+		2 << CHG_SYSTEM_VOLTAGE_THRESHOLD__OFFSET);
+	if (rc < 0) {
+		pr_err("Set System Voltage threshold failed, rc=%d\n", rc);
+		return;
+	}
+
+	rc = smb23x_read(chip, CFG_REG_4, &tmp);
+	if (rc < 0) {
+		pr_err("read CFG_REG_5 failed, rc=%d\n", rc);
+		return;
+	}
+	pr_info("CFG_REG_4:%d\n", tmp);
+
+	rc = smb23x_read(chip, CFG_REG_6, &tmp);
+	if (rc < 0) {
+		pr_err("read CFG_REG_5 failed, rc=%d\n", rc);
+		return;
+	}
+	pr_info("CFG_REG_6:%d\n", tmp);
+}
+
+#define DEFAULT_BATT_CURRENT	500
+static int smb23x_get_current_now(struct smb23x_chip *chip)
+{
+	union power_supply_propval ret = {0, };
+
+	if (chip->bms_psy) {
+		chip->bms_psy->get_property(chip->bms_psy,
+				POWER_SUPPLY_PROP_CURRENT_NOW, &ret);
+		return ret.intval/1000;
+	}
+
+	return DEFAULT_BATT_CURRENT;
+}
+static int smb23x_get_current_avg(struct smb23x_chip *chip)
+{
+	union power_supply_propval ret = {0, };
+
+	if (chip->bms_psy) {
+		chip->bms_psy->get_property(chip->bms_psy,
+				POWER_SUPPLY_PROP_CURRENT_AVG, &ret);
+		return ret.intval/1000;
+	}
+
+	return DEFAULT_BATT_CURRENT;
+}
+
+
+static void smb23x_get_charge_term_sts(struct smb23x_chip *chip, bool *value)
+{
+	u8 tmp;
+	int rc;
+
+	rc = smb23x_read(chip, IRQ_C_STATUS_REG, &tmp);
+	if (rc < 0) {
+		pr_err("read CFG_REG_5 failed, rc=%d\n", rc);
+		return;
+	}
+
+	if (tmp & ITERM_BIT)
+		*value = true;
+	else
+		*value = false;
+}
+
+static void smb23x_get_recharge_sts(struct smb23x_chip *chip, bool *value)
+{
+	u8 tmp;
+	int rc;
+
+	rc = smb23x_read(chip, IRQ_C_STATUS_REG, &tmp);
+	if (rc < 0) {
+		pr_err("read CFG_REG_5 failed, rc=%d\n", rc);
+		return;
+	}
+
+	if (tmp & RECHG_THRESH_BIT)
+		*value = true;
+	else
+		*value = false;
+}
+
+static void smb23x_set_charger_state(struct smb23x_chip *chip, bool disable)
+{
+	pr_info("disable=%d chip->batt_full=%d\n", disable, chip->batt_full);
+	if (disable) {
+		smb23x_charging_disable(chip, CURRENT, true);
+		power_supply_changed(&chip->batt_psy);
+		pr_info("charger_disable1=%d chip->batt_real_full1=%d\n", disable, chip->batt_real_full);
+	} else {
+		smb23x_charging_disable(chip, CURRENT, false);
+		power_supply_changed(&chip->batt_psy);
+		pr_info("charger_disable2=%d chip->batt_real_full2=%d\n", disable, chip->batt_real_full);
+	}
+}
+
+#define DEFAULT_FULLCAP	550
+static int smb23x_get_fullcap(struct smb23x_chip *chip)
+{
+	union power_supply_propval ret = {0, };
+
+	if (chip->bms_psy) {
+		chip->bms_psy->get_property(chip->bms_psy,
+				POWER_SUPPLY_PROP_CHARGE_FULL, &ret);
+		return ret.intval;
+	}
+
+	return DEFAULT_FULLCAP;
+}
+
+#define DEFAULT_REPCAP	250
+static int smb23x_get_repcap(struct smb23x_chip *chip)
+{
+	union power_supply_propval ret = {0, };
+
+	if (chip->bms_psy) {
+		chip->bms_psy->get_property(chip->bms_psy,
+				POWER_SUPPLY_PROP_CHARGE_NOW, &ret);
+		return ret.intval;
+	}
+
+	return DEFAULT_REPCAP;
+}
+
+#define FULL_CAPACITY 100
+#define RECHARGE_CAPACITY 99
+
+static bool smb23x_recharge_now(struct smb23x_chip *chip)
+{
+	int  capacity, fullcap, repcap;
+
+	fullcap = smb23x_get_fullcap(chip);
+	repcap = smb23x_get_repcap(chip);
+	capacity = smb23x_get_prop_batt_real_capacity(chip);
+	pr_info("fullcap:%d, repcap:%d, capacity:%d\n", fullcap, repcap, capacity);
+	if ((capacity < RECHARGE_CAPACITY) || ((fullcap - repcap) * 1000 > (fullcap * 15))) {
+		smb23x_set_charger_state(chip, false);
+		chip->batt_real_full = false;
+		return true;
+	} else
+		return false;
+}
+
+static bool smb23x_check_charge_term(struct smb23x_chip *chip, int current_now)
+{
+	int  capacity, fullcap, repcap;
+
+	fullcap = smb23x_get_fullcap(chip);
+	repcap = smb23x_get_repcap(chip);
+	capacity = smb23x_get_prop_batt_real_capacity(chip);
+	pr_info("fullcap:%d, repcap:%d, capacity:%d\n", fullcap, repcap, capacity);
+	if ((current_now <= 0) && (abs(current_now) < (chip->cfg_iterm_ma + 10)))
+		if ((capacity >= RECHARGE_CAPACITY) && (fullcap == repcap))
+			return true;
+	return false;
+}
+
+#define CONSECUTIVE_COUNT	5
+
+static void smb23x_check_fullcharged_state(struct smb23x_chip *chip)
+{
+	int  current_now, capacity;
+	bool chg_term;
+	static int count = 0;
+
+	capacity = smb23x_get_prop_batt_real_capacity(chip);
+	smb23x_get_charge_term_sts(chip, &chg_term);
+
+	if ((chg_term) && (!chip->batt_real_full)) {
+			__smb23x_charging_disable(chip, true);
+			__smb23x_charging_disable(chip, false);
+			pr_info("[CHG] start re-charging when charger reported DONE and batt_real_full =%d\n",
+					chip->batt_real_full);
+	}
+	current_now = smb23x_get_current_now(chip);
+
+	pr_debug("soc =%d,chg_term:%d,batt_full:%d,current_now:%d,batt_real_full:%d\n",
+		capacity, chg_term, chip->batt_full, current_now, chip->batt_real_full);
+	if (chip->batt_real_full) {
+		if (!smb23x_recharge_now(chip)) {
+			pr_info("do not need charge now\n");
+			return;
+		}
+		pr_info("recharge now\n");
+	} else if (current_now > 0) {
+		pr_info("Charging but system demand increased\n");
+		count = 0;
+	} else if (!smb23x_check_charge_term(chip, current_now)) {
+		pr_info("Not at EOC, current_now=%d,capacity:%d\n", current_now, capacity);
+		count = 0;
+	} else {
+		if (count == CONSECUTIVE_COUNT) {
+			chip->batt_full = true;
+			chip->batt_real_full = true;
+			smb23x_set_charger_state(chip, true);
+		} else {
+			count += 1;
+			pr_info("EOC count = %d\n", count);
+		}
+	}
+}
+
+static bool smb23x_warm_cool_recharge_now(struct smb23x_chip *chip)
+{
+	int voltage_avg;
+	bool recharge_sts;
+
+	voltage_avg = smb23x_get_prop_batt_voltage_avg(chip);
+	smb23x_get_recharge_sts(chip, &recharge_sts);
+	if (!chip->batt_warm_full)
+		return false;
+
+	if (recharge_sts)
+		return true;
+
+	if (chip->tm_state == SMB_TEMP_WARM_STATE) {
+		if (voltage_avg < (chip->cfg_warm_comp_mv - chip->cfg_resume_delta_mv))
+			return true;
+		else
+			return false;
+	}
+
+	if (chip->tm_state == SMB_TEMP_WARM_STATE) {
+		if (voltage_avg < (chip->cfg_cool_comp_mv - chip->cfg_resume_delta_mv))
+			return true;
+		else
+			return false;
+	}
+
+	return false;
+
+}
+
+static void smb23x_warm_cool_check_fullcharged_state(struct smb23x_chip *chip)
+{
+	int  current_now;
+	bool chg_term, recharge_now;
+	static int count = 0;
+
+	current_now = smb23x_get_current_now(chip);
+	recharge_now = smb23x_warm_cool_recharge_now(chip);
+	smb23x_get_charge_term_sts(chip, &chg_term);
+
+	if (chg_term) {
+		chip->batt_warm_full = true;
+		smb23x_set_charger_state(chip, true);
+	}
+
+	pr_debug("chg_term:%d,chip->batt_warm_full:%d,current_avg:%d,recharge_now:%d\n",
+		 chg_term, chip->batt_warm_full, current_now, recharge_now);
+	if (chip->batt_warm_full) {
+		if (recharge_now) {
+			smb23x_set_charger_state(chip, false);
+			chip->batt_warm_full = false;
+		} else {
+			pr_info("do not need charge now\n");
+			return;
+		}
+	} else if (current_now > 0) {
+		pr_info("Charging but system demand increased\n");
+		count = 0;
+	} else if ((current_now * -1) > (chip->cfg_iterm_ma + 10)) {
+		pr_info("Not at EOC, ibat_ma=%d\n", current_now);
+		count = 0;
+	} else {
+		if (count == CONSECUTIVE_COUNT) {
+			chip->batt_warm_full = true;
+			smb23x_set_charger_state(chip, true);
+		} else {
+			count += 1;
+			pr_info("EOC count = %d\n", count);
+		}
+	}
+}
+
+static void smb23x_charger_eoc(struct smb23x_chip *chip)
+{
+	if (!chip->resume_completed) {
+		pr_info("charger_eoc launched before device-resume, schedule to 2s later\n");
+		return;
+	}
+
+	if (chip->usb_present == false) {
+		pr_info("no chg connected, go through directly\n");
+		if (chip->batt_warm_full || chip->batt_full) {
+			smb23x_set_charger_state(chip, false);
+			chip->batt_warm_full = false;
+			chip->batt_full = false;
+		}
+		return;
+	}
+
+	if (chip->batt_present == false) {
+		pr_info("no battery, go through directly\n");
+		return;
+	}
+
+	if (chip->tm_state == SMB_TEMP_NORMAL_STATE) {
+		pr_debug("normal temp\n");
+		if (chip->batt_warm_full) {
+			smb23x_set_charger_state(chip, false);
+			chip->batt_warm_full = false;
+		}
+		smb23x_check_fullcharged_state(chip);
+	}
+
+	if (chip->tm_state == SMB_TEMP_COOL_STATE || chip->tm_state == SMB_TEMP_WARM_STATE) {
+		pr_debug("warm or cool temp\n");
+		smb23x_warm_cool_check_fullcharged_state(chip);
+	}
+}
+
 static int smb23x_hw_init(struct smb23x_chip *chip)
 {
 	int rc, i = 0;
 	u8 tmp;
+	set_batt_hot_cold_threshold(chip->hot_batt_p, chip->cold_batt_p);
 
 	rc = smb23x_enable_volatile_writes(chip);
 	if (rc < 0) {
@@ -1061,6 +1540,9 @@ static int smb23x_hw_init(struct smb23x_chip *chip)
 		}
 	}
 
+	/*System voltage config*/
+	smb23x_system_voltage_set(chip);
+
 	/*
 	 * Disable the STAT pin output, to make the pin keep at open drain
 	 * state and detect the IRQ on the falling edge
@@ -1154,7 +1636,7 @@ static int batt_low_irq_handler(struct smb23x_chip *chip, u8 rt_sts)
 static int pre_to_fast_irq_handler(struct smb23x_chip *chip, u8 rt_sts)
 {
 	pr_debug("rt_sts = 0x02%x\n", rt_sts);
-	chip->batt_full = false;
+	/*chip->batt_full = false;*/
 
 	return 0;
 }
@@ -1168,7 +1650,7 @@ static int chg_error_irq_handler(struct smb23x_chip *chip, u8 rt_sts)
 static int recharge_irq_handler(struct smb23x_chip *chip, u8 rt_sts)
 {
 	pr_debug("rt_sts = 0x02%x\n", rt_sts);
-	chip->batt_full = !rt_sts;
+	/*chip->batt_full = !rt_sts;*/
 	return 0;
 }
 
@@ -1181,60 +1663,14 @@ static int taper_irq_handler(struct smb23x_chip *chip, u8 rt_sts)
 static int iterm_irq_handler(struct smb23x_chip *chip, u8 rt_sts)
 {
 	pr_debug("rt_sts = 0x02%x\n", rt_sts);
-	chip->batt_full = !!rt_sts;
+	/*chip->batt_full = !!rt_sts;*/
+
 	return 0;
 }
 
-static const char * const usb_type_str[] = {
-	"SDP",
-	"UNKNOWN",
-	"DCP",
-	"CDP",
-};
-static int get_usb_supply_type(struct smb23x_chip *chip)
-{
-	int rc;
-	u8 reg, tmp;
-	enum power_supply_type type;
-
-	rc = smb23x_read(chip, CHG_STATUS_C_REG, &reg);
-	if (rc < 0) {
-		pr_err("Read STATUS_C failed, rc=%d\n", rc);
-		return rc;
-	}
-	tmp = reg & APSD_STATUS_BIT;
-
-	if (!tmp) {
-		pr_debug("APSD not completed\n");
-		return POWER_SUPPLY_TYPE_UNKNOWN;
-	}
-
-	tmp = reg & APSD_RESULT_MASK;
-	if (tmp == CDP_TYPE_VAL) {
-		type = POWER_SUPPLY_TYPE_USB_CDP;
-		tmp = 3;
-	} else if (tmp == DCP_TYPE_VAL) {
-		type = POWER_SUPPLY_TYPE_USB_DCP;
-		tmp = 2;
-	} else if (tmp == SDP_TYPE_VAL) {
-		type = POWER_SUPPLY_TYPE_USB;
-		tmp = 0;
-	} else {
-		type = POWER_SUPPLY_TYPE_UNKNOWN;
-		tmp = 1;
-	}
-
-	pr_debug("Charger type %s detected\n", usb_type_str[tmp]);
-
-	return type;
-}
 
 static int handle_usb_insertion(struct smb23x_chip *chip)
 {
-	enum power_supply_type usb_type;
-
-	usb_type = get_usb_supply_type(chip);
-	power_supply_set_supply_type(chip->usb_psy, usb_type);
 	power_supply_set_present(chip->usb_psy, chip->usb_present);
 	power_supply_set_online(chip->usb_psy, true);
 
@@ -1258,14 +1694,25 @@ static int src_detect_irq_handler(struct smb23x_chip *chip, u8 rt_sts)
 	if (!chip->apsd_enabled)
 		return 0;
 
-	pr_debug("chip->usb_present = %d, usb_present = %d\n",
+	pr_info("chip->usb_present = %d, usb_present = %d\n",
 					chip->usb_present, usb_present);
+	if (chip->usb_present ^ usb_present) {
+		wake_lock_timeout(&chip->charger_wake_lock, 5 * HZ);
+	}
 
 	if (usb_present && !chip->usb_present) {
+		pr_info("Charger insert!\n");
+		/*wake_lock(&chip->charger_valid_lock);*/
 		chip->usb_present = usb_present;
 		handle_usb_insertion(chip);
 	} else if (!usb_present && chip->usb_present) {
+		pr_info("Charger removed!\n");
+		/*wake_unlock(&chip->charger_valid_lock);*/
 		chip->usb_present = usb_present;
+		smb23x_charging_disable(chip, CURRENT, false);
+		chip->batt_full = false;
+		chip->batt_warm_full = false;
+		chip->batt_real_full = false;
 		handle_usb_removal(chip);
 	}
 
@@ -1382,6 +1829,18 @@ static int usbin_uv_irq_handler(struct smb23x_chip *chip, u8 rt_sts)
 	if (chip->usb_present == usb_present)
 		return 0;
 
+	wake_lock_timeout(&chip->charger_wake_lock, 5 * HZ);
+	if (!usb_present && chip->usb_present) {
+		pr_info("Charger removed!\n");
+		smb23x_charging_disable(chip, CURRENT, false);
+		chip->batt_full = false;
+		chip->batt_warm_full = false;
+		chip->batt_real_full = false;
+		/*wake_unlock(&chip->charger_valid_lock);*/
+	} else if (usb_present && !chip->usb_present) {
+		pr_info("Charger insert!\n");
+		/*wake_lock(&chip->charger_valid_lock);*/
+	}
 	chip->usb_present = usb_present;
 	reconfig_upon_unplug(chip);
 	power_supply_set_present(chip->usb_psy, usb_present);
@@ -1543,7 +2002,8 @@ static int smb23x_determine_initial_status(struct smb23x_chip *chip)
 	}
 	UPDATE_IRQ_STAT(IRQ_C_STATUS_REG, reg);
 	if (reg & ITERM_BIT)
-		chip->batt_full = true;
+		smb23x_charger_eoc(chip);
+		/*chip->batt_full = true;*/
 
 	rc = smb23x_read(chip, IRQ_D_STATUS_REG, &reg);
 	if (rc < 0) {
@@ -1572,6 +2032,9 @@ static int smb23x_determine_initial_status(struct smb23x_chip *chip)
 		power_supply_set_present(chip->usb_psy, chip->usb_present);
 		reconfig_upon_unplug(chip);
 	}
+	chip->high_temp_threshold = chip->cfg_warm_bat_decidegc;
+	chip->low_temp_threshold = chip->cfg_cool_bat_decidegc;
+	chip->tm_state = SMB_TEMP_NORMAL_STATE;
 
 	return rc;
 }
@@ -1671,6 +2134,8 @@ static enum power_supply_property smb23x_battery_properties[] = {
 	POWER_SUPPLY_PROP_CAPACITY,
 	POWER_SUPPLY_PROP_TEMP,
 	POWER_SUPPLY_PROP_SYSTEM_TEMP_LEVEL,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
 };
 
 static int smb23x_get_prop_batt_health(struct smb23x_chip *chip)
@@ -1762,35 +2227,56 @@ exit:
 	return POWER_SUPPLY_CHARGE_TYPE_UNKNOWN;
 }
 
-#define DEFAULT_BATT_CAPACITY	50
-static int smb23x_get_prop_batt_capacity(struct smb23x_chip *chip)
+extern int set_cblpwr_pon_disable(void);
+static int  set_cblpwr_pon = 1;
+static int smb23x_cblpwr_pon_disable(const char *val, struct kernel_param *kp)
 {
-	union power_supply_propval ret = {0, };
+	int ret;
 
-	if (chip->fake_battery_soc != -EINVAL)
-		return chip->fake_battery_soc;
-
-	if (chip->bms_psy) {
-		chip->bms_psy->get_property(chip->bms_psy,
-				POWER_SUPPLY_PROP_CAPACITY, &ret);
-		return ret.intval;
+	ret = param_set_int(val, kp);
+	if (ret) {
+		pr_err("error setting value %d\n", ret);
+		return ret;
+	}
+	if (set_cblpwr_pon == 0) {
+		set_cblpwr_pon_disable();
+		pr_info("set_cblpwr_pon_disable\n");
 	}
 
-	return DEFAULT_BATT_CAPACITY;
+	return ret;
 }
+module_param_call(set_cblpwr_pon, smb23x_cblpwr_pon_disable, param_get_uint,
+					&set_cblpwr_pon, 0644);
 
-#define DEFAULT_BATT_TEMP	280
-static int smb23x_get_prop_batt_temp(struct smb23x_chip *chip)
+#define DEFAULT_BATT_TEMP	250
+#define HOT_TEMP 600
+
+static int smb23x_get_prop_batt_temp(struct smb23x_chip *chip, int *batt_temp)
 {
-	union power_supply_propval ret = {0, };
+	int rc;
+	struct qpnp_vadc_result result;
 
-	if (chip->bms_psy) {
-		chip->bms_psy->get_property(chip->bms_psy,
-				POWER_SUPPLY_PROP_TEMP, &ret);
-		return ret.intval;
+	if (is_fake_battery) {
+		*batt_temp = DEFAULT_BATT_TEMP;
+		return 0;
 	}
 
-	return DEFAULT_BATT_TEMP;
+	rc = qpnp_vadc_read(chip->vadc_dev, LR_MUX1_BATT_THERM, &result);
+	if (rc) {
+		pr_err("error reading adc channel = %d, rc = %d\n",
+					LR_MUX1_BATT_THERM, rc);
+		return rc;
+	}
+
+	pr_debug("batt_temp phy = %lld meas = 0x%llx\n",
+			result.physical, result.measurement);
+
+	*batt_temp = (int)result.physical;
+
+	if (*batt_temp > HOT_TEMP)
+		set_cblpwr_pon_disable();
+
+	return 0;
 }
 
 static int smb23x_system_temp_level_set(struct smb23x_chip *chip, int lvl_sel)
@@ -1818,7 +2304,7 @@ static int smb23x_system_temp_level_set(struct smb23x_chip *chip, int lvl_sel)
 
 	mutex_lock(&chip->icl_set_lock);
 	chip->therm_lvl_sel = lvl_sel;
-
+	pr_info("chip->therm_lvl_sel:%d\n", chip->therm_lvl_sel);
 	rc = smb23x_set_appropriate_usb_current(chip);
 	if (rc)
 		pr_err("Couldn't set USB current rc = %d\n", rc);
@@ -1833,6 +2319,7 @@ static int smb23x_battery_get_property(struct power_supply *psy,
 {
 	struct smb23x_chip *chip = container_of(psy,
 			struct smb23x_chip, batt_psy);
+	int value = 0, rc;
 
 	switch (prop) {
 	case POWER_SUPPLY_PROP_HEALTH:
@@ -1857,10 +2344,19 @@ static int smb23x_battery_get_property(struct power_supply *psy,
 		val->intval = smb23x_get_prop_batt_capacity(chip);
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
-		val->intval = smb23x_get_prop_batt_temp(chip);
+		 rc = smb23x_get_prop_batt_temp(chip, &value);
+		 if (rc < 0)
+			value = DEFAULT_BATT_TEMP;
+		 val->intval = value;
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		val->intval = smb23x_get_prop_batt_voltage(chip) * 1000;
 		break;
 	case POWER_SUPPLY_PROP_SYSTEM_TEMP_LEVEL:
 		val->intval = chip->therm_lvl_sel;
+		break;
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+		val->intval = smb23x_get_current_now(chip);
 		break;
 	default:
 		return (-EINVAL);
@@ -1955,6 +2451,16 @@ static int smb23x_battery_is_writeable(struct power_supply *psy,
 	return rc;
 }
 
+static void smb23x_get_bms_psy(struct smb23x_chip *chip)
+{
+	if (chip->bms_psy_name && chip->bms_psy == NULL) {
+		if (chip->board_ver_id == 1) {
+			chip->bms_psy = power_supply_get_by_name((char *)chip->bms_psy_name);
+		} else {
+			chip->bms_psy = power_supply_get_by_name("bms");
+		}
+	}
+}
 static void smb23x_external_power_changed(struct power_supply *psy)
 {
 	struct smb23x_chip *chip = container_of(psy,
@@ -1963,9 +2469,7 @@ static void smb23x_external_power_changed(struct power_supply *psy)
 	int icl = 0, rc;
 	bool online;
 
-	if (chip->bms_psy_name && chip->bms_psy == NULL)
-		chip->bms_psy =
-			power_supply_get_by_name((char *)chip->bms_psy_name);
+	smb23x_get_bms_psy(chip);
 
 	rc = chip->usb_psy->get_property(chip->usb_psy,
 			POWER_SUPPLY_PROP_CURRENT_MAX, &prop);
@@ -1973,7 +2477,7 @@ static void smb23x_external_power_changed(struct power_supply *psy)
 		pr_err("Get CURRENT_MAX from usb failed, rc=%d\n", rc);
 	else
 		icl = prop.intval / 1000;
-	pr_debug("current_limit = %d\n", icl);
+	pr_info("current_limit = %d\n", icl);
 
 	if (chip->usb_psy_ma != icl) {
 		mutex_lock(&chip->icl_set_lock);
@@ -2246,6 +2750,339 @@ static void smb23x_irq_polling_wa_check(struct smb23x_chip *chip)
 
 	pr_debug("use polling: %d\n", !(reg & UNPLUG_RELOAD_DIS_BIT));
 }
+#define MIN_IBAT_MA		100
+#define MAX_IBAT_MA		500
+int set_ibat(struct smb23x_chip *chip, int ma)
+{
+	int rc,i;
+
+	if(ma < MIN_IBAT_MA){
+		ma = MIN_IBAT_MA;
+		pr_err("bad battery charge current ma =%d asked to set\n",ma);
+	}else if(ma > MAX_IBAT_MA){
+		ma = MAX_IBAT_MA;
+		pr_err("bad battery charge current ma =%d asked to set\n",ma);
+	}
+	/* fastchg current setting */
+	i = find_closest_in_ascendant_list(
+		ma, fastchg_current_ma_table,
+		ARRAY_SIZE(fastchg_current_ma_table));
+
+	rc = smb23x_masked_write(chip, CFG_REG_2,
+			FASTCHG_CURR_MASK, i);
+	if (rc < 0) {
+		pr_err("Set fastchg current failed, rc=%d\n", rc);
+		return rc;
+	}
+
+	pr_debug("ibat current set to = %d\n", fastchg_current_ma_table[i]);
+
+	return 0;
+}
+
+void smb23x_set_appropriate_ibat(struct smb23x_chip *chip)
+{
+	int chg_current = chip->cfg_fastchg_ma;
+	pr_debug("chip->batt_cool:%d, chip->batt_warm:%d, chip->cfg_cool_comp_ma:%d\n",
+			chip->batt_cool, chip->batt_warm, chip->cfg_cool_comp_ma);
+	pr_debug("chip->cfg_warm_comp_ma:%d, chip->cfg_fastchg_ma:%d\n",
+			chip->cfg_warm_comp_ma, chip->cfg_fastchg_ma);
+
+	if (chip->batt_cool){
+		chg_current = min(chg_current, chip->cfg_cool_comp_ma);
+	}
+	if (chip->batt_warm)
+	{
+		chg_current = min(chg_current, chip->cfg_warm_comp_ma);
+	}
+	pr_debug("setting %d mA\n", chg_current);
+
+	set_ibat(chip, chg_current);
+}
+
+static int smb23x_float_voltage_set(struct smb23x_chip *chip, int vfloat_mv)
+{
+	u8 temp;
+	int rc;
+	pr_debug("set vfloat_mv:%d\n",vfloat_mv);
+	if ((vfloat_mv < MIN_FLOAT_MV) || (vfloat_mv > MAX_FLOAT_MV)) {
+		pr_err("bad float voltage mv =%d asked to set\n",
+					vfloat_mv);
+		return -EINVAL;
+	}
+
+	temp = (vfloat_mv - MIN_FLOAT_MV) / FLOAT_STEP_MV;
+	rc = smb23x_masked_write(chip, CFG_REG_3,
+			FLOAT_VOLTAGE_MASK, temp);
+	if (rc < 0) {
+		pr_err("Set float voltage failed, rc=%d\n", rc);
+		return rc;
+	}
+
+	return rc;
+}
+
+static void smb23x_set_appropriate_float_voltage(struct smb23x_chip *chip)
+{
+	pr_debug("is_cold=%d is_cool=%d is_warm=%d cool_bat_mv=%d mv warm_bat_mv=%d mv\n",
+			chip->batt_cold,
+			chip->batt_cool,
+			chip->batt_warm,
+			chip->cfg_cool_comp_mv,
+			chip->cfg_warm_comp_mv
+			);
+	pr_debug("vfloat_mv=%dmv warm_resume_delta_mv=%dmv\n",
+			chip->cfg_vfloat_mv,
+			chip->cfg_resume_delta_mv
+			);
+	if (chip->batt_cool)
+	{
+		smb23x_float_voltage_set(chip, chip->cfg_cool_comp_mv);
+	}
+	else if (chip->batt_warm)
+	{
+		smb23x_float_voltage_set(chip, chip->cfg_warm_comp_mv);
+	}
+	else
+	{
+		smb23x_float_voltage_set(chip, chip->cfg_vfloat_mv);
+	}
+}
+
+#define SMB_HOT_TEMP_DEFAULT        500
+#define SMB_COLD_TEMP_DEFAULT       0
+#define SMB_WARM_TEMP_DEFAULT       450
+#define SMB_COOL_TEMP_DEFAULT       100
+#define HYSTERISIS_DECIDEGC         20
+#define MAX_TEMP                    800
+#define MIN_TEMP                   -300
+
+/*
+ * smb23x_charge_current_limit
+ * set appropriate voltages and currents.
+ *
+ * (TODO)Note that when the battery is hot or cold, the charger
+ * driver will not resume with SoC. Only vbatdet is used to
+ * determine resume of charging.
+ */
+
+/* NOTE(by ZTE JZN):
+*  if vbatt>warm_bat_mv and charging is enabled, battery will discharging and iusb=0 ;
+*  if vbatt>warm_bat_mv and charging is disabled, iusb will be the currnt source and ibat=0 .
+*  so, there is a bug in the below codes:if vbatt>warm_bat_mv,battery will discharging and iusb=0
+*/
+static void smb23x_charge_current_limit(struct smb23x_chip *chip)
+{
+	smb23x_set_appropriate_usb_current(chip);
+	smb23x_set_appropriate_ibat(chip);
+	smb23x_set_appropriate_float_voltage(chip);
+	smb23x_charging_disable(chip, THERMAL, false);
+	power_supply_changed(&chip->batt_psy);
+
+}
+static void smb23x_update_temp_state(struct smb23x_chip *chip)
+{
+	chip->batt_hot = (chip->tm_state == SMB_TEMP_HOT_STATE) ? true : false;
+	chip->batt_warm = (chip->tm_state == SMB_TEMP_WARM_STATE) ? true : false;
+	chip->batt_cool = (chip->tm_state == SMB_TEMP_COOL_STATE) ? true : false;
+	chip->batt_cold = (chip->tm_state == SMB_TEMP_COLD_STATE) ? true : false;
+}
+static void smb23x_temp_state_changed(struct smb23x_chip *chip)
+{
+	smb23x_update_temp_state(chip);
+
+	switch (chip->tm_state) {
+	case(SMB_TEMP_COLD_STATE):
+		chip->low_temp_threshold = MIN_TEMP;
+		chip->high_temp_threshold = chip->cfg_cold_bat_decidegc + HYSTERISIS_DECIDEGC;
+		smb23x_charging_disable(chip, THERMAL, true);
+		power_supply_changed(&chip->batt_psy);
+		break;
+	case(SMB_TEMP_COOL_STATE):
+		chip->low_temp_threshold = chip->cfg_cold_bat_decidegc;
+		chip->high_temp_threshold = chip->cfg_cool_bat_decidegc + HYSTERISIS_DECIDEGC;
+		smb23x_charge_current_limit(chip);
+		break;
+	case(SMB_TEMP_NORMAL_STATE):
+		chip->low_temp_threshold = chip->cfg_cool_bat_decidegc;
+		chip->high_temp_threshold = chip->cfg_warm_bat_decidegc;
+		smb23x_charge_current_limit(chip);
+		break;
+	case(SMB_TEMP_WARM_STATE):
+		chip->low_temp_threshold = chip->cfg_warm_bat_decidegc - HYSTERISIS_DECIDEGC;
+		chip->high_temp_threshold = chip->cfg_hot_bat_decidegc;
+		smb23x_charge_current_limit(chip);
+		break;
+	case(SMB_TEMP_HOT_STATE):
+		chip->low_temp_threshold = chip->cfg_hot_bat_decidegc - HYSTERISIS_DECIDEGC;
+		chip->high_temp_threshold = MAX_TEMP;
+		smb23x_charging_disable(chip, THERMAL, true);
+		power_supply_changed(&chip->batt_psy);
+		break;
+	default:
+		break;
+	}
+}
+
+static void smb23x_set_bms_temp(struct smb23x_chip *chip, int temp)
+{
+	union power_supply_propval ret = {0,};
+
+	if (chip->bms_psy) {
+		ret.intval = temp;
+		chip->bms_psy->set_property(chip->bms_psy,
+			POWER_SUPPLY_PROP_TEMP, &ret);
+	}
+
+}
+
+#define NORMAL_HEARTBEAT_PRINT_COUNT 10
+static void update_heartbeat(struct smb23x_chip *chip)
+{
+	int temp, voltage, cap, status, charge_type, present, chg_current;
+	static int old_temp = 0;
+	static int old_cap = 0;
+	static int old_status = 0;
+	static int old_present = 0;
+	static int printk_counter = 0;
+
+	if (chip == NULL) {
+		pr_err("pmic fatal error:the_chip=null\n!!");
+		return;
+	}
+
+	smb23x_get_prop_batt_temp(chip, &temp);
+	voltage		=	smb23x_get_prop_batt_voltage(chip);
+	cap			=	smb23x_get_prop_batt_capacity(chip);
+	status		=	smb23x_get_prop_batt_status(chip);
+	charge_type	=	smb23x_get_prop_charge_type(chip);
+	present		=	smb23x_get_prop_batt_present(chip);
+	chg_current	=	smb23x_get_current_now(chip);
+
+	printk_counter++;
+
+	if ((abs(temp-old_temp) >= 1) || (old_cap != cap) || (old_status != status)
+	|| (old_present != present) || (printk_counter >= NORMAL_HEARTBEAT_PRINT_COUNT)) {
+		pr_info("temp=%d, vol=%d, cap=%d, status=%d,chg_state=%d,current=%d\n",
+				temp / 10, voltage, cap, status, charge_type, chg_current);
+		pr_info("present=%d,usb_present=%d, batt_full=%d, tm_state=%d,batt_real_full:%d\n",
+				present, chip->usb_present, chip->batt_full, chip->tm_state, chip->batt_real_full);
+		if (chip->board_ver_id == 1)
+			pr_info("***current_avg=%d, voltage_avg=%d, board_id=%d, batt_warm_full=%d, full_cap=%d, repcap=%d\n",
+				smb23x_get_current_avg(chip), smb23x_get_prop_batt_voltage_avg(chip),
+				chip->board_ver_id, chip->batt_warm_full,
+				smb23x_get_fullcap(chip), smb23x_get_repcap(chip));
+
+		old_temp = temp;
+		old_cap = cap;
+		old_status = status;
+		old_present = present;
+		printk_counter = 0;
+		power_supply_changed(&chip->batt_psy);
+	}
+}
+
+#define TEMP_DETECT_WORK_DELAY_2S 2000
+#define TEMP_DETECT_WORK_DELAY_30S 30000
+static void smb23x_temp_control_func(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct smb23x_chip *chip = container_of(dwork, struct smb23x_chip, temp_control_work);
+	int state = SMB_TM_NORMAL_STATE;
+	int temp = 0;
+	int period = TEMP_DETECT_WORK_DELAY_2S;
+
+	if (!chip->resume_completed) {
+		pr_err("smb23x_temp_control_func launched before device-resume, schedule to 2s later\n");
+		schedule_delayed_work(&chip->temp_control_work,round_jiffies_relative(msecs_to_jiffies(2000)));
+		return;
+	}
+
+	update_heartbeat(chip);
+	smb23x_get_prop_batt_temp(chip, &temp);
+	if (chip->board_ver_id == 1) {
+		smb23x_charger_eoc(chip);
+		smb23x_set_bms_temp(chip, temp);
+	}
+
+	if (temp > MAX_TEMP)
+		temp = MAX_TEMP;
+	if (temp < MIN_TEMP)
+		temp = MIN_TEMP;
+
+	if (temp > chip->high_temp_threshold)
+		state = SMB_TM_HIGHER_STATE;
+	else if (temp < chip->low_temp_threshold)
+		state = SMB_TM_LOWER_STATE;
+	else
+		state = SMB_TM_NORMAL_STATE;
+
+	mutex_lock(&chip->jeita_configure_lock);
+
+	if (state == SMB_TM_HIGHER_STATE) {
+		switch (chip->tm_state) {
+		case(SMB_TEMP_COLD_STATE):
+			chip->tm_state = SMB_TEMP_COOL_STATE;
+			break;
+		case(SMB_TEMP_COOL_STATE):
+			chip->tm_state = SMB_TEMP_NORMAL_STATE;
+			break;
+		case(SMB_TEMP_NORMAL_STATE):
+			chip->tm_state = SMB_TEMP_WARM_STATE;
+			break;
+		case(SMB_TEMP_WARM_STATE):
+			chip->tm_state = SMB_TEMP_HOT_STATE;
+			break;
+		}
+		smb23x_temp_state_changed(chip);
+	} else if (state == SMB_TM_LOWER_STATE) {
+		switch (chip->tm_state) {
+		case(SMB_TEMP_COOL_STATE):
+			chip->tm_state = SMB_TEMP_COLD_STATE;
+			break;
+		case(SMB_TEMP_NORMAL_STATE):
+			chip->tm_state = SMB_TEMP_COOL_STATE;
+			break;
+		case(SMB_TEMP_WARM_STATE):
+			chip->tm_state = SMB_TEMP_NORMAL_STATE;
+			break;
+		case(SMB_TEMP_HOT_STATE):
+			chip->tm_state = SMB_TEMP_WARM_STATE;
+			break;
+		}
+		smb23x_temp_state_changed(chip);
+	} else {
+		pr_debug("SMB_TM_NORMAL_STATE");
+		goto check_again;
+	}
+check_again:
+	mutex_unlock(&chip->jeita_configure_lock);
+
+	if ((state == SMB_TM_HIGHER_STATE) || (state == SMB_TM_LOWER_STATE)) {
+		pr_info("temp=%d threshold=(%d-%d) health=(%d-%d-%d-%d)\n",
+				temp, chip->low_temp_threshold, chip->high_temp_threshold,
+				chip->batt_cold, chip->batt_cool,
+				chip->batt_warm, chip->batt_hot);
+	}
+
+	if (chip->tm_state == SMB_TEMP_NORMAL_STATE)
+		period = TEMP_DETECT_WORK_DELAY_30S;
+	else
+		period = TEMP_DETECT_WORK_DELAY_2S;
+	schedule_delayed_work(&chip->temp_control_work, round_jiffies_relative(msecs_to_jiffies(period)));
+}
+
+static enum alarmtimer_restart update_temp_alarm_cb(struct alarm *alarm,
+							ktime_t now)
+{
+	struct smb23x_chip *chip = container_of(alarm, struct smb23x_chip,
+											update_temp_alarm);
+
+	pr_info("alarm fired, usb_present=%d\n", chip->usb_present);
+
+	return ALARMTIMER_NORESTART;
+
+}
 
 static int smb23x_probe(struct i2c_client *client,
 			const struct i2c_device_id *id)
@@ -2268,6 +3105,17 @@ static int smb23x_probe(struct i2c_client *client,
 	chip->dev = &client->dev;
 	chip->usb_psy = usb_psy;
 	chip->fake_battery_soc = -EINVAL;
+	chip->board_ver_id = socinfo_get_board_ver_id();
+	chip->vadc_dev = qpnp_get_vadc(chip->dev, "smb23x");
+	if (IS_ERR(chip->vadc_dev)) {
+		rc = PTR_ERR(chip->vadc_dev);
+		if (rc != -EPROBE_DEFER)
+			pr_err("%s ,vadc property missing\n", __func__);
+		else
+			pr_err("%s ,vadc property fail\n", __func__);
+		chip->vadc_dev = NULL;
+		return rc;
+	}
 	i2c_set_clientdata(client, chip);
 
 	mutex_init(&chip->read_write_lock);
@@ -2275,8 +3123,15 @@ static int smb23x_probe(struct i2c_client *client,
 	mutex_init(&chip->chg_disable_lock);
 	mutex_init(&chip->usb_suspend_lock);
 	mutex_init(&chip->icl_set_lock);
+	mutex_init(&chip->jeita_configure_lock);
 	smb23x_wakeup_src_init(chip);
+	wake_lock_init(&chip->charger_wake_lock, WAKE_LOCK_SUSPEND, "zte_chg_event");
+	wake_lock_init(&chip->charger_valid_lock, WAKE_LOCK_SUSPEND, "zte_chg_valid");
 	INIT_DELAYED_WORK(&chip->irq_polling_work, smb23x_irq_polling_work_fn);
+	INIT_DELAYED_WORK(&chip->temp_control_work, smb23x_temp_control_func);
+
+	alarm_init(&chip->update_temp_alarm, ALARM_REALTIME,
+			update_temp_alarm_cb);
 
 	/* enable the USB_SUSPEND always */
 	chip->workaround_flags |= WRKRND_USB_SUSPEND;
@@ -2333,6 +3188,8 @@ static int smb23x_probe(struct i2c_client *client,
 	chip->batt_psy.external_power_changed = smb23x_external_power_changed;
 	chip->batt_psy.property_is_writeable = smb23x_battery_is_writeable;
 
+	smb23x_get_bms_psy(chip);
+
 	if (chip->cfg_bms_controlled_charging) {
 		chip->batt_psy.supplied_to	= batt_supplied_to;
 		chip->batt_psy.num_supplicants	=
@@ -2359,9 +3216,10 @@ static int smb23x_probe(struct i2c_client *client,
 	}
 
 	create_debugfs_entries(chip);
+	schedule_delayed_work(&chip->temp_control_work, 0);
 
-	pr_info("SMB23x successfully probed batt=%d usb = %d\n",
-			smb23x_get_prop_batt_present(chip), chip->usb_present);
+	pr_info("SMB23x successfully probed batt=%d usb = %d,board_id = %d\n",
+			smb23x_get_prop_batt_present(chip), chip->usb_present, chip->board_ver_id);
 
 	return 0;
 unregister_batt_psy:
@@ -2397,6 +3255,19 @@ static int smb23x_suspend(struct device *dev)
 	mutex_lock(&chip->irq_complete);
 	chip->resume_completed = false;
 	mutex_unlock(&chip->irq_complete);
+	cancel_delayed_work_sync(&chip->temp_control_work);
+
+	if (chip->usb_present) {
+		alarm_start_relative(&chip->update_temp_alarm,
+				ns_to_ktime(BMS_NORMAL_UPDATE_TEMP_INTERVAL_NS));
+		pr_info("start alarm to %llds with charger\n",
+				BMS_NORMAL_UPDATE_TEMP_INTERVAL_NS/1000000000);
+	} else {
+		alarm_start_relative(&chip->update_temp_alarm,
+				ns_to_ktime(BMS_SLOW_UPDATE_TEMP_INTERVAL_NS));
+		pr_info("start alarm to %llds with no charger\n",
+				BMS_SLOW_UPDATE_TEMP_INTERVAL_NS/1000000000);
+	}
 
 	return 0;
 }
@@ -2433,6 +3304,9 @@ static int smb23x_resume(struct device *dev)
 	} else {
 		mutex_unlock(&chip->irq_complete);
 	}
+	schedule_delayed_work(&chip->temp_control_work, 0);
+	alarm_cancel(&chip->update_temp_alarm);
+	pr_info("cancel alarm\n");
 
 	return 0;
 }
@@ -2440,6 +3314,7 @@ static int smb23x_resume(struct device *dev)
 static int smb23x_remove(struct i2c_client *client)
 {
 	struct smb23x_chip *chip = i2c_get_clientdata(client);
+	cancel_delayed_work_sync(&chip->temp_control_work);
 
 	power_supply_unregister(&chip->batt_psy);
 	wakeup_source_trash(&chip->smb23x_ws.source);
@@ -2448,6 +3323,7 @@ static int smb23x_remove(struct i2c_client *client)
 	mutex_destroy(&chip->chg_disable_lock);
 	mutex_destroy(&chip->usb_suspend_lock);
 	mutex_destroy(&chip->icl_set_lock);
+	mutex_destroy(&chip->jeita_configure_lock);
 
 	return 0;
 }

@@ -1,4 +1,5 @@
-/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
+/*
+ * Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -3354,7 +3355,8 @@ int mdss_mdp_igc_lut_config(struct msm_fb_data_type *mfd,
 	disp_num = config->block - MDP_LOGICAL_BLOCK_DISP_0;
 
 	if (config->ops & MDP_PP_OPS_READ) {
-		if (config->len != IGC_LUT_ENTRIES) {
+		if (config->len != IGC_LUT_ENTRIES &&
+		    !pp_ops[IGC].pp_get_config) {
 			pr_err("invalid len for IGC table for read %d\n",
 			       config->len);
 			return -EINVAL;
@@ -4173,11 +4175,6 @@ gamut_clk_off:
 			} else {
 				goto gamut_set_dirty;
 			}
-		}
-		if (pp_gm_has_invalid_lut_size(config)) {
-			pr_err("invalid lut size for gamut\n");
-			ret = -EINVAL;
-			goto gamut_config_exit;
 		}
 		local_cfg = *config;
 		tbl_off = mdss_pp_res->gamut_tbl[disp_num];

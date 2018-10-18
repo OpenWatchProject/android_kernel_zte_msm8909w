@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -36,7 +36,6 @@
 	pr_err(DEV_NAME " %s:%d " fmt, __func__, __LINE__, ## args)
 
 extern struct ipa_qmi_context *ipa_qmi_ctx;
-extern struct mutex ipa_qmi_lock;
 
 struct ipa_qmi_context {
 struct ipa_ioc_ext_intf_prop q6_ul_filter_rule[MAX_NUM_Q6_RULE];
@@ -158,10 +157,6 @@ int ipa_qmi_stop_data_qouta(void);
 
 void ipa_q6_handshake_complete(bool ssr_bootup);
 
-void ipa_qmi_init(void);
-
-void ipa_qmi_cleanup(void);
-
 #else /* CONFIG_RMNET_IPA */
 
 static inline int ipa_qmi_service_init(uint32_t wan_platform_type)
@@ -266,14 +261,6 @@ static inline int ipa_qmi_stop_data_qouta(void)
 }
 
 static inline void ipa_q6_handshake_complete(bool ssr_bootup) { }
-
-static inline void ipa_qmi_init(void)
-{
-}
-
-static inline void ipa_qmi_cleanup(void)
-{
-}
 
 #endif /* CONFIG_RMNET_IPA */
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2015-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -60,6 +60,8 @@ extern const u8 msm8x16_wcd_reg_readable[MSM8X16_WCD_CACHE_SIZE];
 extern const u8 msm8x16_wcd_reg_readonly[MSM8X16_WCD_CACHE_SIZE];
 extern const u8 msm8x16_wcd_reset_reg_defaults[MSM8X16_WCD_CACHE_SIZE];
 extern const u8 cajon_digital_reg[MSM8X16_WCD_CACHE_SIZE];
+
+extern int ext_spk_pa_gpio;
 
 enum codec_versions {
 	TOMBAK_1_0,
@@ -218,6 +220,7 @@ struct msm8916_asoc_mach_data {
 	int spk_ext_pa_gpio;
 	int mclk_freq;
 	int lb_mode;
+	int afe_clk_ver;
 	u8 micbias1_cap_mode;
 	u8 micbias2_cap_mode;
 	atomic_t mclk_rsc_ref;
@@ -301,6 +304,7 @@ struct msm8x16_wcd_priv {
 	unsigned long status_mask;
 	struct wcd_imped_i_ref imped_i_ref;
 	enum wcd_mbhc_imp_det_pin imped_det_pin;
+	struct delayed_work work;
 };
 
 extern int msm8x16_wcd_mclk_enable(struct snd_soc_codec *codec, int mclk_enable,

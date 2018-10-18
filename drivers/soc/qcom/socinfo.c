@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009-2017, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2009-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -46,7 +46,6 @@
 #define SMEM_IMAGE_VERSION_OEM_OFFSET 96
 #define SMEM_IMAGE_VERSION_PARTITION_APPS 10
 
-static DECLARE_RWSEM(current_image_rwsem);
 enum {
 	HW_PLATFORM_UNKNOWN = 0,
 	HW_PLATFORM_SURF    = 1,
@@ -567,6 +566,49 @@ static struct socinfo_v0_1 dummy_socinfo = {
 	.version = 1,
 };
 
+static int board_ver_id = -1;
+void socinfo_set_board_ver_id(int val)
+{
+	board_ver_id = val;
+}
+
+int socinfo_get_board_ver_id(void)
+{
+	return board_ver_id;
+}
+EXPORT_SYMBOL(socinfo_get_board_ver_id);
+
+#define SOCINFO_CMDLINE_BOARD_VER_ID "androidboot.board_ver_id="
+#define BOARD_VER_ID_0 "0"
+#define BOARD_VER_ID_1 "1"
+#define BOARD_VER_ID_2 "2"
+#define BOARD_VER_ID_3 "3"
+
+enum board_ver_id {
+	BOOT_VER_0 = 0,
+	BOOT_VER_1 = 1,
+	BOOT_VER_2 = 2,
+	BOOT_VER_3 = 3,
+};
+
+static int __init board_ver_id_init(char *ver)
+{
+	int board_id = BOOT_VER_1;
+
+	if (!strncmp(ver, BOARD_VER_ID_0, strlen(BOARD_VER_ID_0)))
+		board_id = BOOT_VER_0;
+	else if (!strncmp(ver, BOARD_VER_ID_1, strlen(BOARD_VER_ID_1)))
+		board_id = BOOT_VER_1;
+	else if (!strncmp(ver, BOARD_VER_ID_2, strlen(BOARD_VER_ID_2)))
+		board_id = BOOT_VER_2;
+	else if (!strncmp(ver, BOARD_VER_ID_3, strlen(BOARD_VER_ID_3)))
+		board_id = BOOT_VER_3;
+
+	socinfo_set_board_ver_id(board_id);
+	return 0;
+}
+__setup(SOCINFO_CMDLINE_BOARD_VER_ID, board_ver_id_init);
+
 uint32_t socinfo_get_id(void)
 {
 	return (socinfo) ? socinfo->v0_1.id : 0;
@@ -855,9 +897,7 @@ msm_get_image_version(struct device *dev,
 		pr_err("Failed to get image version base address");
 		return snprintf(buf, SMEM_IMAGE_VERSION_NAME_SIZE, "Unknown");
 	}
-	down_read(&current_image_rwsem);
 	string_address += current_image * SMEM_IMAGE_VERSION_SINGLE_BLOCK_SIZE;
-	up_read(&current_image_rwsem);
 	return snprintf(buf, SMEM_IMAGE_VERSION_NAME_SIZE, "%-.75s\n",
 			string_address);
 }
@@ -870,19 +910,14 @@ msm_set_image_version(struct device *dev,
 {
 	char *store_address;
 
-	down_read(&current_image_rwsem);
-	if (current_image != SMEM_IMAGE_VERSION_PARTITION_APPS) {
-		up_read(&current_image_rwsem);
+	if (current_image != SMEM_IMAGE_VERSION_PARTITION_APPS)
 		return count;
-	}
 	store_address = socinfo_get_image_version_base_address();
 	if (IS_ERR_OR_NULL(store_address)) {
 		pr_err("Failed to get image version base address");
-		up_read(&current_image_rwsem);
 		return count;
 	}
 	store_address += current_image * SMEM_IMAGE_VERSION_SINGLE_BLOCK_SIZE;
-	up_read(&current_image_rwsem);
 	snprintf(store_address, SMEM_IMAGE_VERSION_NAME_SIZE, "%-.75s", buf);
 	return count;
 }
@@ -900,9 +935,7 @@ msm_get_image_variant(struct device *dev,
 		return snprintf(buf, SMEM_IMAGE_VERSION_VARIANT_SIZE,
 		"Unknown");
 	}
-	down_read(&current_image_rwsem);
 	string_address += current_image * SMEM_IMAGE_VERSION_SINGLE_BLOCK_SIZE;
-	up_read(&current_image_rwsem);
 	string_address += SMEM_IMAGE_VERSION_VARIANT_OFFSET;
 	return snprintf(buf, SMEM_IMAGE_VERSION_VARIANT_SIZE, "%-.20s\n",
 			string_address);
@@ -916,19 +949,14 @@ msm_set_image_variant(struct device *dev,
 {
 	char *store_address;
 
-	down_read(&current_image_rwsem);
-	if (current_image != SMEM_IMAGE_VERSION_PARTITION_APPS) {
-		up_read(&current_image_rwsem);
+	if (current_image != SMEM_IMAGE_VERSION_PARTITION_APPS)
 		return count;
-	}
 	store_address = socinfo_get_image_version_base_address();
 	if (IS_ERR_OR_NULL(store_address)) {
 		pr_err("Failed to get image version base address");
-		up_read(&current_image_rwsem);
 		return count;
 	}
 	store_address += current_image * SMEM_IMAGE_VERSION_SINGLE_BLOCK_SIZE;
-	up_read(&current_image_rwsem);
 	store_address += SMEM_IMAGE_VERSION_VARIANT_OFFSET;
 	snprintf(store_address, SMEM_IMAGE_VERSION_VARIANT_SIZE, "%-.20s", buf);
 	return count;
@@ -946,9 +974,7 @@ msm_get_image_crm_version(struct device *dev,
 		pr_err("Failed to get image version base address");
 		return snprintf(buf, SMEM_IMAGE_VERSION_OEM_SIZE, "Unknown");
 	}
-	down_read(&current_image_rwsem);
 	string_address += current_image * SMEM_IMAGE_VERSION_SINGLE_BLOCK_SIZE;
-	up_read(&current_image_rwsem);
 	string_address += SMEM_IMAGE_VERSION_OEM_OFFSET;
 	return snprintf(buf, SMEM_IMAGE_VERSION_OEM_SIZE, "%-.32s\n",
 			string_address);
@@ -962,19 +988,14 @@ msm_set_image_crm_version(struct device *dev,
 {
 	char *store_address;
 
-	down_read(&current_image_rwsem);
-	if (current_image != SMEM_IMAGE_VERSION_PARTITION_APPS) {
-		up_read(&current_image_rwsem);
+	if (current_image != SMEM_IMAGE_VERSION_PARTITION_APPS)
 		return count;
-	}
 	store_address = socinfo_get_image_version_base_address();
 	if (IS_ERR_OR_NULL(store_address)) {
 		pr_err("Failed to get image version base address");
-		up_read(&current_image_rwsem);
 		return count;
 	}
 	store_address += current_image * SMEM_IMAGE_VERSION_SINGLE_BLOCK_SIZE;
-	up_read(&current_image_rwsem);
 	store_address += SMEM_IMAGE_VERSION_OEM_OFFSET;
 	snprintf(store_address, SMEM_IMAGE_VERSION_OEM_SIZE, "%-.32s", buf);
 	return count;
@@ -985,14 +1006,8 @@ msm_get_image_number(struct device *dev,
 			struct device_attribute *attr,
 			char *buf)
 {
-	int ret;
-
-	down_read(&current_image_rwsem);
-	ret = snprintf(buf, PAGE_SIZE, "%d\n",
+	return snprintf(buf, PAGE_SIZE, "%d\n",
 			current_image);
-	up_read(&current_image_rwsem);
-	return ret;
-
 }
 
 static ssize_t
@@ -1004,12 +1019,10 @@ msm_select_image(struct device *dev, struct device_attribute *attr,
 	ret = kstrtoint(buf, 10, &digit);
 	if (ret)
 		return ret;
-	down_write(&current_image_rwsem);
 	if (0 <= digit && digit < SMEM_IMAGE_VERSION_BLOCKS_COUNT)
 		current_image = digit;
 	else
 		current_image = 0;
-	up_write(&current_image_rwsem);
 	return count;
 }
 

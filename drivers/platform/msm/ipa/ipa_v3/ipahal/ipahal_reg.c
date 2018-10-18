@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -992,12 +992,7 @@ static struct ipahal_reg_obj ipahal_reg_objs[IPA_HW_MAX][IPA_REG_MAX] = {
 	[IPA_HW_v3_0][IPA_RX_HPS_CLIENTS_MAX_DEPTH_1] = {
 		ipareg_construct_rx_hps_clients_depth1, ipareg_parse_dummy,
 		0x000023D0, 0},
-	[IPA_HW_v3_0][IPA_DPS_SEQUENCER_FIRST] = {
-		ipareg_construct_dummy, ipareg_parse_dummy,
-		0x0001e000, 0},
-	[IPA_HW_v3_0][IPA_HPS_SEQUENCER_FIRST] = {
-		ipareg_construct_dummy, ipareg_parse_dummy,
-		0x0001e080, 0},
+
 
 	/* IPAv3.1 */
 	[IPA_HW_v3_1][IPA_IRQ_SUSPEND_INFO_EE_n] = {
@@ -1305,13 +1300,6 @@ void ipahal_get_aggr_force_close_valmask(int ep_idx,
 	valmask->mask =
 		IPA_AGGR_FORCE_CLOSE_OFST_AGGR_FORCE_CLOSE_PIPE_BITMAP_BMSK <<
 		IPA_AGGR_FORCE_CLOSE_OFST_AGGR_FORCE_CLOSE_PIPE_BITMAP_SHFT;
-
-
-	if (ep_idx > (sizeof(valmask->val) * 8 - 1)) {
-		IPAHAL_ERR("too big ep_idx %d\n", ep_idx);
-		ipa_assert();
-		return;
-	}
 }
 
 void ipahal_get_fltrt_hash_flush_valmask(

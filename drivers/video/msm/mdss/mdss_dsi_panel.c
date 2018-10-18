@@ -398,7 +398,7 @@ int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 			gpio_set_value((ctrl_pdata->disp_en_gpio), 0);
 			gpio_free(ctrl_pdata->disp_en_gpio);
 		}
-		gpio_set_value((ctrl_pdata->rst_gpio), 0);
+		gpio_set_value((ctrl_pdata->rst_gpio), 1);
 		gpio_free(ctrl_pdata->rst_gpio);
 		if (gpio_is_valid(ctrl_pdata->mode_gpio))
 			gpio_free(ctrl_pdata->mode_gpio);
@@ -832,6 +832,41 @@ end:
 	return 0;
 }
 
+static char oled_idle_cmd_page[2] = {0xFE, 0x0};
+static char oled_idle_in_cmd[2] = {0x39, 0x0};
+static char oled_idle_out_cmd[2] = {0x38, 0x0};
+
+static struct dsi_cmd_desc olde_idle_in[] = {
+	{{DTYPE_DCS_WRITE1, 1, 0, 0, 1, sizeof(oled_idle_cmd_page)},
+	oled_idle_cmd_page},
+	{{DTYPE_DCS_WRITE1, 1, 0, 0, 1, sizeof(oled_idle_in_cmd)},
+	oled_idle_in_cmd}
+};
+static struct dsi_cmd_desc olde_idle_out[] = {
+	{{DTYPE_DCS_WRITE1, 1, 0, 0, 5, sizeof(oled_idle_cmd_page)},
+	oled_idle_cmd_page},
+	{{DTYPE_DCS_WRITE1, 1, 0, 0, 1, sizeof(oled_idle_out_cmd)},
+	oled_idle_out_cmd}
+};
+static void mdss_dsi_panel_set_idle_state(struct mdss_dsi_ctrl_pdata *ctrl,
+	int enter_idle_mode)
+{
+	struct dcs_cmd_req cmdreq;
+
+	memset(&cmdreq, 0, sizeof(cmdreq));
+
+	if (enter_idle_mode)
+		cmdreq.cmds = olde_idle_in;
+	else
+		cmdreq.cmds = olde_idle_out;
+
+	cmdreq.cmds_cnt = 2;
+	cmdreq.flags = CMD_REQ_COMMIT | CMD_CLK_CTRL;
+	cmdreq.rlen = 0;
+	cmdreq.cb = NULL;
+
+	mdss_dsi_cmdlist_put(ctrl, &cmdreq);
+}
 static int mdss_dsi_panel_low_power_config(struct mdss_panel_data *pdata,
 	int enable)
 {
@@ -851,6 +886,13 @@ static int mdss_dsi_panel_low_power_config(struct mdss_panel_data *pdata,
 		enable);
 
 	/* Any panel specific low power commands/config */
+	if (enable) {
+		mdss_dsi_panel_set_idle_state(ctrl, 1);
+		pr_info("LCD panel idle in!\n");
+	} else {
+		mdss_dsi_panel_set_idle_state(ctrl, 0);
+		pr_info("LCD panel idle out!\n");
+	}
 
 	/* Control idle mode for panel */
 	mdss_dsi_panel_set_idle_mode(pdata, enable);

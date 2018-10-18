@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2016,2018 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -59,9 +59,6 @@
 #define BALIGN		128
 #define NUM_CHANNELS	3		/*1 compute 1 cpz 1 mdsp*/
 #define NUM_SESSIONS	8		/*8 compute*/
-#define FASTRPC_CTX_MAGIC (0xbeeddeed)
-#define FASTRPC_CTX_MAX (256)
-#define FASTRPC_CTXID_MASK (0xFF0)
 
 #define IS_CACHE_ALIGNED(x) (((x) & ((L1_CACHE_BYTES)-1)) == 0)
 
@@ -140,8 +137,6 @@ struct smq_invoke_ctx {
 	uint32_t sc;
 	struct overlap *overs;
 	struct overlap **overps;
-	unsigned int magic;
-	uint64_t ctxid;
 };
 
 struct fastrpc_ctx_lst {
@@ -194,8 +189,6 @@ struct fastrpc_apps {
 	spinlock_t hlock;
 	struct ion_client *client;
 	struct device *dev;
-	spinlock_t ctxlock;
-	struct smq_invoke_ctx *ctxtable[FASTRPC_CTX_MAX];
 };
 
 struct fastrpc_mmap {
@@ -685,9 +678,9 @@ static int overlap_ptr_cmp(const void *a, const void *b)
 	return st == 0 ? ed : st;
 }
 
-static int context_build_overlap(struct smq_invoke_ctx *ctx)
+static void context_build_overlap(struct smq_invoke_ctx *ctx)
 {
-	int i, err = 0;
+	int i;
 	remote_arg_t *lpra = ctx->lpra;
 	int inbufs = REMOTE_SCALARS_INBUFS(ctx->sc);
 	int outbufs = REMOTE_SCALARS_OUTBUFS(ctx->sc);
@@ -696,11 +689,6 @@ static int context_build_overlap(struct smq_invoke_ctx *ctx)
 	for (i = 0; i < nbufs; ++i) {
 		ctx->overs[i].start = (uintptr_t)lpra[i].buf.pv;
 		ctx->overs[i].end = ctx->overs[i].start + lpra[i].buf.len;
-		if (lpra[i].buf.len) {
-			VERIFY(err, ctx->overs[i].end > ctx->overs[i].start);
-			if (err)
-				goto bail;
-		}
 		ctx->overs[i].raix = i;
 		ctx->overps[i] = &ctx->overs[i];
 	}
@@ -726,8 +714,6 @@ static int context_build_overlap(struct smq_invoke_ctx *ctx)
 			max = *ctx->overps[i];
 		}
 	}
-bail:
-	return err;
 }
 
 #define K_COPY_FROM_USER(err, kernel, dst, src, size) \
@@ -755,9 +741,8 @@ static int context_alloc(struct fastrpc_file *fl, uint32_t kernel,
 			 struct fastrpc_ioctl_invoke_fd *invokefd,
 			 struct smq_invoke_ctx **po)
 {
-	int err = 0, bufs, ii, size = 0;
-	struct fastrpc_apps *me = &gfa;
-	struct smq_invoke_ctx *ctx = NULL;
+	int err = 0, bufs, size = 0;
+	struct smq_invoke_ctx *ctx = 0;
 	struct fastrpc_ctx_lst *clst = &fl->clst;
 	struct fastrpc_ioctl_invoke *invoke = &invokefd->inv;
 
@@ -792,35 +777,16 @@ static int context_alloc(struct fastrpc_file *fl, uint32_t kernel,
 			goto bail;
 	}
 	ctx->sc = invoke->sc;
-	if (bufs) {
-		VERIFY(err, 0 == context_build_overlap(ctx));
-		if (err)
-			goto bail;
-	}
+	if (bufs)
+		context_build_overlap(ctx);
 	ctx->retval = -1;
 	ctx->pid = current->pid;
 	ctx->tgid = current->tgid;
 	init_completion(&ctx->work);
-	ctx->magic = FASTRPC_CTX_MAGIC;
 
 	spin_lock(&fl->hlock);
 	hlist_add_head(&ctx->hn, &clst->pending);
 	spin_unlock(&fl->hlock);
-
-	spin_lock(&me->ctxlock);
-	for (ii = 0; ii < FASTRPC_CTX_MAX; ii++) {
-		if (!me->ctxtable[ii]) {
-			me->ctxtable[ii] = ctx;
-			ctx->ctxid = (ptr_to_uint64(ctx) & ~0xFFF)|(ii << 4);
-			break;
-		}
-	}
-	spin_unlock(&me->ctxlock);
-	VERIFY(err, ii < FASTRPC_CTX_MAX);
-	if (err) {
-		pr_err("adsprpc: out of context memory\n");
-		goto bail;
-	}
 
 	*po = ctx;
 bail:
@@ -843,7 +809,6 @@ static void context_save_interrupted(struct smq_invoke_ctx *ctx)
 static void context_free(struct smq_invoke_ctx *ctx)
 {
 	int i;
-	struct fastrpc_apps *me = &gfa;
 	int nbufs = REMOTE_SCALARS_INBUFS(ctx->sc) +
 		    REMOTE_SCALARS_OUTBUFS(ctx->sc);
 	spin_lock(&ctx->fl->hlock);
@@ -852,18 +817,6 @@ static void context_free(struct smq_invoke_ctx *ctx)
 	for (i = 0; i < nbufs; ++i)
 		fastrpc_mmap_free(ctx->maps[i]);
 	fastrpc_buf_free(ctx->buf, 1);
-	ctx->magic = 0;
-	ctx->ctxid = 0;
-
-	spin_lock(&me->ctxlock);
-	for (i = 0; i < FASTRPC_CTX_MAX; i++) {
-		if (me->ctxtable[i] == ctx) {
-			me->ctxtable[i] = NULL;
-			break;
-		}
-	}
-	spin_unlock(&me->ctxlock);
-
 	kfree(ctx);
 }
 
@@ -991,6 +944,7 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 	/* calculate len requreed for copying */
 	for (oix = 0; oix < inbufs + outbufs; ++oix) {
 		int i = ctx->overps[oix]->raix;
+		uintptr_t mstart, mend;
 		ssize_t len = lpra[i].buf.len;
 		if (!len)
 			continue;
@@ -998,7 +952,15 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 			continue;
 		if (ctx->overps[oix]->offset == 0)
 			copylen = ALIGN(copylen, BALIGN);
-		copylen += ctx->overps[oix]->mend - ctx->overps[oix]->mstart;
+		mstart = ctx->overps[oix]->mstart;
+		mend = ctx->overps[oix]->mend;
+		VERIFY(err, (mend - mstart) <= LONG_MAX);
+		if (err)
+			goto bail;
+		copylen += mend - mstart;
+		VERIFY(err, copylen >= 0);
+		if (err)
+			goto bail;
 	}
 	ctx->used = copylen;
 
@@ -1063,7 +1025,7 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 	for (oix = 0; oix < inbufs + outbufs; ++oix) {
 		int i = ctx->overps[oix]->raix;
 		struct fastrpc_mmap *map = ctx->maps[i];
-		int mlen = ctx->overps[oix]->mend - ctx->overps[oix]->mstart;
+		ssize_t mlen = ctx->overps[oix]->mend - ctx->overps[oix]->mstart;
 		uint64_t buf;
 		ssize_t len = lpra[i].buf.len;
 		if (!len)
@@ -1222,7 +1184,7 @@ static int fastrpc_invoke_send(struct smq_invoke_ctx *ctx,
 	msg.tid = current->pid;
 	if (kernel)
 		msg.pid = 0;
-	msg.invoke.header.ctx = ctx->ctxid;
+	msg.invoke.header.ctx = ptr_to_uint64(ctx);
 	msg.invoke.header.handle = handle;
 	msg.invoke.header.sc = ctx->sc;
 	msg.invoke.page.addr = ctx->buf ? ctx->buf->phys : 0;
@@ -1239,34 +1201,15 @@ static void fastrpc_read_handler(int cid)
 {
 	struct fastrpc_apps *me = &gfa;
 	struct smq_invoke_rsp rsp = {0};
-	int ret = 0, err = 0;
-	uint32_t index;
+	int ret = 0;
 
 	do {
 		ret = smd_read_from_cb(me->channel[cid].chan, &rsp,
 					sizeof(rsp));
 		if (ret != sizeof(rsp))
 			break;
-		index = (uint32_t)((rsp.ctx & FASTRPC_CTXID_MASK) >> 4);
-		VERIFY(err, index < FASTRPC_CTX_MAX);
-		if (err)
-			goto bail;
-
-		VERIFY(err, !IS_ERR_OR_NULL(me->ctxtable[index]));
-		if (err)
-			goto bail;
-
-		VERIFY(err, ((me->ctxtable[index]->ctxid == (rsp.ctx)) &&
-			me->ctxtable[index]->magic == FASTRPC_CTX_MAGIC));
-		if (err)
-			goto bail;
-
-		context_notify_user(me->ctxtable[index], rsp.retval);
+		context_notify_user(uint64_to_ptr(rsp.ctx), rsp.retval);
 	} while (ret == sizeof(rsp));
-
-bail:
-	if (err)
-			pr_err("adsprpc: invalid response or context\n");
 }
 
 static void smd_event_handler(void *priv, unsigned event)
@@ -1292,7 +1235,6 @@ static void fastrpc_init(struct fastrpc_apps *me)
 	int i;
 	INIT_HLIST_HEAD(&me->drivers);
 	spin_lock_init(&me->hlock);
-	spin_lock_init(&me->ctxlock);
 	mutex_init(&me->smd_mutex);
 	me->channel = &gcinfo[0];
 	for (i = 0; i < NUM_CHANNELS; i++) {
@@ -1722,11 +1664,6 @@ static int fastrpc_file_free(struct fastrpc_file *fl)
 	spin_lock(&fl->apps->hlock);
 	hlist_del_init(&fl->hn);
 	spin_unlock(&fl->apps->hlock);
-
-	if (!fl->sctx) {
-		kfree(fl);
-		return 0;
-	}
 
 	(void)fastrpc_release_current_dsp_process(fl);
 	fastrpc_context_list_dtor(fl);
